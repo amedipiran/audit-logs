@@ -127,6 +127,7 @@ Get-AzStorageAccountManagementPolicy `
 🚨 Creating Activity Log alerts for diagnostic setting updates/deletions (REST)...
 📝 Enabling Diagnostic Settings for Subscription Activity Logs -> Storage (REST)...
 🔐 Enabling Microsoft Entra (Azure AD) Audit/Sign-in logs -> Storage...
+✅ Policies created and assigned (Storage Accounts + Key Vaults).
 
 ✅ Setup completed successfully!
    Resource Group        : rg-audit-archive-prod
@@ -138,6 +139,7 @@ Get-AzStorageAccountManagementPolicy `
    Alerts created        : Diagnostic write/delete (Activity Log)
    Sub Activity Logs DS  : Enabled (via REST)
    Entra Logs DS         : Enabled (Audit, Sign-in, etc.)
+   
 ```
 ---
 
