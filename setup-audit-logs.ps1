@@ -10,6 +10,9 @@
     - Enable Diagnostic Settings:
         * Subscription Activity Logs  -> Storage (via REST)
         * Microsoft Entra (Audit & Sign-in) -> Storage (via REST)
+    - (Re-added) Azure Policies (DeployIfNotExists) to enforce Diagnostic Settings to Storage:
+        * Microsoft.Storage/storageAccounts
+        * Microsoft.KeyVault/vaults
 
   Notes:
     - Run this in PowerShell 7+ (pwsh).
@@ -55,7 +58,6 @@ $missing = $needed | Where-Object { -not (Get-Module -ListAvailable -Name $_) }
 if ($missing) {
   Write-Host "⚠️  Missing modules: $($missing -join ', ')." -ForegroundColor Yellow
   Write-Host "    Install with: Install-Module $($missing -join ',') -Scope CurrentUser -Force" -ForegroundColor Yellow
-  # We continue; if unavailable at runtime, cmdlets will throw with clear errors.
 }
 Import-Module Az.Storage -ErrorAction SilentlyContinue | Out-Null
 #endregion
@@ -227,6 +229,187 @@ try {
   Invoke-AzRestMethod -Method PUT -Path "$entraResourceId?api-version=$entraApiVersion" -Payload $entraPayload | Out-Null
 
   # --------------------------------------------------------------------
+  # 7) Azure Policies (DeployIfNotExists) — enforce Diagnostic Settings to Storage
+  # --------------------------------------------------------------------
+  Write-Host "🏛️ Creating custom Azure Policies and assigning at subscription scope..." -ForegroundColor Cyan
+  $policyApi = "2021-06-01"
+  $subScope  = "/subscriptions/$SubscriptionId"
+
+  function Put-Rest {
+    param([string] $Path, [hashtable] $Body)
+    $json = $Body | ConvertTo-Json -Depth 50
+    Invoke-AzRestMethod -Method PUT -Path "$Path?api-version=$policyApi" -Payload $json | Out-Null
+  }
+
+  function Ensure-PolicyDefinition {
+    param(
+      [string] $DefinitionName,
+      [string] $DisplayName,
+      [hashtable] $Parameters,
+      [hashtable] $PolicyRule
+    )
+    $defId = "$subScope/providers/Microsoft.Authorization/policyDefinitions/$DefinitionName"
+    $body  = @{
+      properties = @{
+        displayName = $DisplayName
+        policyType  = "Custom"
+        mode        = "Indexed"
+        parameters  = $Parameters
+        policyRule  = $PolicyRule
+      }
+    }
+    Put-Rest -Path $defId -Body $body
+    return $defId
+  }
+
+  function Ensure-PolicyAssignment {
+    param(
+      [string] $AssignmentName,
+      [string] $DisplayName,
+      [string] $PolicyDefinitionId,
+      [hashtable] $Parameters
+    )
+    $assignId = "$subScope/providers/Microsoft.Authorization/policyAssignments/$AssignmentName"
+    $armParams = @{}
+    foreach ($k in $Parameters.Keys) { $armParams[$k] = @{ value = $Parameters[$k] } }
+    $body = @{
+      properties = @{
+        displayName       = $DisplayName
+        scope             = $subScope
+        policyDefinitionId= $PolicyDefinitionId
+        parameters        = $armParams
+        enforcementMode   = "Default"
+      }
+    }
+    Put-Rest -Path $assignId -Body $body
+    return $assignId
+  }
+
+  # ---- (A) Storage Accounts -> Diagnostic Settings to Storage ----
+  $defNameSt = "dpifn-diagnostic-to-storage-StorageAccounts"
+  $dispNameSt= "[DeployIfNotExists] Storage Accounts: enable Diagnostic Settings to Storage"
+  $paramsSt = @{
+    storageAccountId = @{ type = "String"; metadata = @{ displayName = "Target Storage Account Resource ID" } }
+    diagSettingName  = @{ type = "String"; defaultValue = "ds-platform-to-storage" }
+  }
+  $policyRuleSt = @{
+    if = @{ allOf = @(@{ field = "type"; equals = "Microsoft.Storage/storageAccounts" }) }
+    then = @{
+      effect  = "DeployIfNotExists"
+      details = @{
+        type = "Microsoft.Insights/diagnosticSettings"
+        existenceCondition = @{
+          allOf = @(
+            @{ field = "Microsoft.Insights/diagnosticSettings/storageAccountId"; equals = "[parameters('storageAccountId')]" }
+          )
+        }
+        roleDefinitionIds = @(
+          "/providers/microsoft.authorization/roleDefinitions/3913510d-42f4-4e42-8a64-420c390055eb" # Monitoring Metrics Publisher
+        )
+        deployment = @{
+          properties = @{
+            mode     = "incremental"
+            template = @{
+              '$schema'      = "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#"
+              contentVersion = "1.0.0.0"
+              parameters     = @{
+                diagSettingName  = @{ type = "string" }
+                storageAccountId = @{ type = "string" }
+              }
+              resources      = @(
+                @{
+                  type       = "Microsoft.Insights/diagnosticSettings"
+                  name       = "[parameters('diagSettingName')]"
+                  apiVersion = "2021-05-01-preview"
+                  properties = @{
+                    storageAccountId = "[parameters('storageAccountId')]"
+                    logs = @(
+                      @{ category = "StorageRead";   enabled = $true },
+                      @{ category = "StorageWrite";  enabled = $true },
+                      @{ category = "StorageDelete"; enabled = $true }
+                    )
+                    metrics = @(
+                      @{ category = "AllMetrics"; enabled = $true }
+                    )
+                  }
+                }
+              )
+            }
+            parameters = @{
+              diagSettingName  = @{ value = "[parameters('diagSettingName')]" }
+              storageAccountId = @{ value = "[parameters('storageAccountId')]" }
+            }
+          }
+        }
+      }
+    }
+  }
+  $defIdSt = Ensure-PolicyDefinition -DefinitionName $defNameSt -DisplayName $dispNameSt -Parameters $paramsSt -PolicyRule $policyRuleSt
+  $assignIdSt = Ensure-PolicyAssignment -AssignmentName "assign-$defNameSt" -DisplayName $dispNameSt -PolicyDefinitionId $defIdSt -Parameters @{ storageAccountId = $st.Id }
+
+  # ---- (B) Key Vaults -> Diagnostic Settings to Storage ----
+  $defNameKv = "dpifn-diagnostic-to-storage-KeyVaults"
+  $dispNameKv= "[DeployIfNotExists] Key Vaults: enable Diagnostic Settings to Storage"
+  $paramsKv = @{
+    storageAccountId = @{ type = "String"; metadata = @{ displayName = "Target Storage Account Resource ID" } }
+    diagSettingName  = @{ type = "String"; defaultValue = "ds-platform-to-storage" }
+  }
+  $policyRuleKv = @{
+    if = @{ allOf = @(@{ field = "type"; equals = "Microsoft.KeyVault/vaults" }) }
+    then = @{
+      effect  = "DeployIfNotExists"
+      details = @{
+        type = "Microsoft.Insights/diagnosticSettings"
+        existenceCondition = @{
+          allOf = @(
+            @{ field = "Microsoft.Insights/diagnosticSettings/storageAccountId"; equals = "[parameters('storageAccountId')]" }
+          )
+        }
+        roleDefinitionIds = @(
+          "/providers/microsoft.authorization/roleDefinitions/3913510d-42f4-4e42-8a64-420c390055eb"
+        )
+        deployment = @{
+          properties = @{
+            mode     = "incremental"
+            template = @{
+              '$schema'      = "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#"
+              contentVersion = "1.0.0.0"
+              parameters     = @{
+                diagSettingName  = @{ type = "string" }
+                storageAccountId = @{ type = "string" }
+              }
+              resources      = @(
+                @{
+                  type       = "Microsoft.Insights/diagnosticSettings"
+                  name       = "[parameters('diagSettingName')]"
+                  apiVersion = "2021-05-01-preview"
+                  properties = @{
+                    storageAccountId = "[parameters('storageAccountId')]"
+                    logs = @(
+                      @{ category = "AuditEvent"; enabled = $true }
+                    )
+                    metrics = @(
+                      @{ category = "AllMetrics"; enabled = $true }
+                    )
+                  }
+                }
+              )
+            }
+            parameters = @{
+              diagSettingName  = @{ value = "[parameters('diagSettingName')]" }
+              storageAccountId = @{ value = "[parameters('storageAccountId')]" }
+            }
+          }
+        }
+      }
+    }
+  }
+  $defIdKv = Ensure-PolicyDefinition -DefinitionName $defNameKv -DisplayName $dispNameKv -Parameters $paramsKv -PolicyRule $policyRuleKv
+  $assignIdKv = Ensure-PolicyAssignment -AssignmentName "assign-$defNameKv" -DisplayName $dispNameKv -PolicyDefinitionId $defIdKv -Parameters @{ storageAccountId = $st.Id }
+
+  Write-Host "✅ Policies created and assigned (Storage Accounts + Key Vaults)." -ForegroundColor Green
+
+  # --------------------------------------------------------------------
   # Summary
   # --------------------------------------------------------------------
   Write-Host ""
@@ -240,7 +423,12 @@ try {
   Write-Host ("   Alerts created        : Diagnostic write/delete (Activity Log)")
   Write-Host ("   Sub Activity Logs DS  : Enabled (via REST)")
   Write-Host ("   Entra Logs DS         : Enabled (Audit, Sign-in, etc.)")
+  Write-Host ("   Policy Assignments    : {0}; {1}" -f ("assign-$defNameSt"), ("assign-$defNameKv"))
   Write-Host ""
+  Write-Host "Next steps:" -ForegroundColor Cyan
+  Write-Host " - Portal: Storage → Data management → Lifecycle management (verify rule 'archive-after-91')" -ForegroundColor Cyan
+  Write-Host " - Policy compliance takes time; check Azure Policy compliance after ~30–60 min" -ForegroundColor Cyan
+  Write-Host " - (Optional) Add more DINE policies for other resource types (App Service, SQL, AKS, etc.)" -ForegroundColor Cyan
 
 } catch {
   Write-Host "❌ Error: $($_.Exception.Message)" -ForegroundColor Red
