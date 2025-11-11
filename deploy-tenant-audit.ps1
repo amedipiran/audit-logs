@@ -18,8 +18,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ProgressPreference    = 'SilentlyContinue'
-$ConfirmPreference     = 'None'
+$ProgressPreference = 'SilentlyContinue'
+$ConfirmPreference = 'None'
 $PSDefaultParameterValues['*:Confirm'] = $false
 
 function Initialize-Modules {
@@ -124,9 +124,9 @@ function New-FlexFunctionApp([string]$homeSubId,[string]$rg,[string]$name,[strin
     -Payload (@{ identity = @{ type = "SystemAssigned" } } | ConvertTo-Json) | Out-Null
 
   Update-AzFunctionAppSetting -Name $name -ResourceGroupName $rg -AppSetting @{
-    'FUNCTIONS_WORKER_RUNTIME'      = 'powershell'
-    'FUNCTIONS_EXTENSION_VERSION'   = '~4'
-    'WEBSITE_TIME_ZONE'             = 'W. Europe Standard Time'
+    'FUNCTIONS_WORKER_RUNTIME' = 'powershell'
+    'FUNCTIONS_EXTENSION_VERSION' = '~4'
+    'WEBSITE_TIME_ZONE' = 'W. Europe Standard Time'
     'AzureWebJobsSecretStorageType' = 'files'
   } -Force | Out-Null
 
@@ -177,7 +177,7 @@ function Wait-LatestDeployment([hashtable]$hdr,[string]$name,[int]$timeoutSec=60
   $sw = [Diagnostics.Stopwatch]::StartNew()
   while($sw.Elapsed.TotalSeconds -lt $timeoutSec){
     $d = Invoke-RestMethod -Headers $hdr -Uri $uri -Method GET -ErrorAction SilentlyContinue
-    if($d -and $d.status -eq 4){ return $true }  # 4 = Success
+    if($d -and $d.status -eq 4){ return $true }
     Start-Sleep -Seconds 3
   }
   return $false
