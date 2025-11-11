@@ -1,0 +1,259 @@
+[CmdletBinding(PositionalBinding=$false)]
+param(
+  [string] $Cron = '0 30 16 * * *'
+)
+
+$ErrorActionPreference = 'Stop'
+
+function New-TmpDir {
+  $root = Join-Path ([IO.Path]::GetTempPath()) ("fn-" + [guid]::NewGuid())
+  New-Item -ItemType Directory -Path $root -Force | Out-Null
+  $root
+}
+
+$root = New-TmpDir
+try {
+  # host.json
+  @'
+{
+  "version": "2.0",
+  "managedDependency": { "enabled": true },
+  "extensionBundle": {
+    "id": "Microsoft.Azure.Functions.ExtensionBundle",
+    "version": "[4.*, 5.0.0)"
+  }
+}
+'@ | Set-Content -Path (Join-Path $root 'host.json') -Encoding UTF8
+
+  # requirements.psd1 
+  @'
+@{
+  "Az.Accounts"  = "2.*"
+  "Az.Resources" = "6.*"
+  "Az.Monitor"   = "5.*"
+  "Az.Storage"   = "6.*"
+}
+'@ | Set-Content -Path (Join-Path $root 'requirements.psd1') -Encoding UTF8
+
+  # ===== AuditTimer =====
+  $timerDir = New-Item -ItemType Directory -Path (Join-Path $root 'AuditTimer') -Force
+
+  @"
+{
+  "bindings": [
+    { "name": "Timer", "type": "timerTrigger", "direction": "in", "schedule": "$Cron" }
+  ],
+  "scriptFile": "run.ps1"
+}
+"@ | Set-Content -Path (Join-Path $timerDir 'function.json') -Encoding UTF8
+
+  @'
+param($Timer)
+
+$ErrorActionPreference = "Stop"
+$ProgressPreference    = "SilentlyContinue"
+
+Write-Host "=== AuditTimer START $(Get-Date -Format u) ==="
+if ($Timer.IsPastDue) { Write-Warning "Timer is running late." }
+
+# Helpers 
+function Get-BlobText {
+  param([object]$Context, [string]$Container, [string]$BlobName)
+  try {
+    $tmp = New-TemporaryFile
+    $dl  = Get-AzStorageBlobContent -Context $Context -Container $Container -Blob $BlobName `
+            -Destination $tmp -Force -ErrorAction SilentlyContinue
+    if ($dl -and (Test-Path $tmp)) { return Get-Content -Path $tmp -Raw }
+    return $null
+  } finally {
+    if ($tmp -and (Test-Path $tmp)) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+  }
+}
+
+function Put-BlobText {
+  param([object]$Context, [string]$Container, [string]$BlobName, [string]$Text)
+  $tmp = New-TemporaryFile
+  try {
+    Set-Content -Path $tmp -Value $Text -Encoding UTF8
+    Set-AzStorageBlobContent -Context $Context -Container $Container -File $tmp -Blob $BlobName -Force | Out-Null
+  } finally {
+    if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+  }
+}
+
+function Append-Lines-ToBlob {
+  param(
+    [object]$Context,
+    [string]$Container,
+    [string]$BlobName,
+    [string[]]$Lines
+  )
+  $tmp = New-TemporaryFile
+  try {
+    $exists = $false
+    try {
+      $dl = Get-AzStorageBlobContent -Context $Context -Container $Container `
+              -Blob $BlobName -Destination $tmp -Force -ErrorAction SilentlyContinue
+      if ($dl -and (Test-Path $tmp)) { $exists = $true }
+    } catch {}
+
+    if ($exists) {
+      # Skip header on append
+      $Lines | Select-Object -Skip 1 | Add-Content -Path $tmp -Encoding UTF8
+    } else {
+      $Lines | Set-Content -Path $tmp -Encoding UTF8
+    }
+
+    Set-AzStorageBlobContent -Context $Context -Container $Container -File $tmp -Blob $BlobName -Force | Out-Null
+  } finally {
+    if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+  }
+}
+
+# ------------ Environment / Settings ------------
+$RG          = $env:AUDIT_RG
+$ST_ACCOUNT  = $env:AUDIT_ST_ACCOUNT
+$CONTAINER   = $env:AUDIT_CONTAINER
+$PREFIX      = if ($env:AUDIT_PREFIX) { $env:AUDIT_PREFIX } else { 'AzActivity' }
+$HOME_SUB    = $env:AUDIT_HOME_SUB  
+$TENANT_ID   = $env:AUDIT_TENANT_ID 
+
+if ([string]::IsNullOrWhiteSpace($RG) -or
+    [string]::IsNullOrWhiteSpace($ST_ACCOUNT) -or
+    [string]::IsNullOrWhiteSpace($CONTAINER)) {
+  throw "Missing settings: AUDIT_RG='$RG' AUDIT_ST_ACCOUNT='$ST_ACCOUNT' AUDIT_CONTAINER='$CONTAINER'"
+}
+
+# Auth & Storage Context
+Import-Module Az.Accounts
+Import-Module Az.Resources
+Import-Module Az.Monitor
+Import-Module Az.Storage
+
+Write-Host "Connecting with Managed Identity..."
+Connect-AzAccount -Identity -WarningAction SilentlyContinue | Out-Null
+$ctxNow = Get-AzContext
+Write-Host "Context Tenant: $($ctxNow.Tenant.Id)  Subscription: $($ctxNow.Subscription.Id)"
+
+if ($HOME_SUB) {
+  try {
+    Select-AzSubscription -SubscriptionId $HOME_SUB | Out-Null
+    Write-Host "Selected AUDIT_HOME_SUB=$HOME_SUB"
+  } catch {
+    Write-Warning "Could not Select-AzSubscription $HOME_SUB : $($_.Exception.Message)"
+  }
+}
+
+# Use AAD to access Storage (no keys)
+$stObj = Get-AzStorageAccount -ResourceGroupName $RG -Name $ST_ACCOUNT
+if (-not $stObj) { throw "Storage account not found: RG=$RG Name=$ST_ACCOUNT" }
+$stCtx = New-AzStorageContext -StorageAccountName $ST_ACCOUNT -UseConnectedAccount
+
+# Ensure the target container exists
+if (-not (Get-AzStorageContainer -Context $stCtx -Name $CONTAINER -ErrorAction SilentlyContinue)) {
+  New-AzStorageContainer -Name $CONTAINER -Context $stCtx -Permission Off | Out-Null
+  Write-Host "Created container '$CONTAINER'"
+}
+
+# ------------ Time Window (UTC: today → now) ------------
+$nowUtc = (Get-Date).ToUniversalTime()
+$dayUtc = $nowUtc.Date
+$from   = $dayUtc
+$to     = $nowUtc
+Write-Host "Query window: $($from.ToString('u')) → $($to.ToString('u'))"
+
+# ------------ Discover Subscriptions ------------
+$subs = @()
+try {
+  $subs = Get-AzSubscription -ErrorAction Stop | Where-Object { $_.State -eq 'Enabled' }
+} catch {
+  Write-Warning "Get-AzSubscription failed: $($_.Exception.Message)"
+}
+
+if (($subs | Measure-Object).Count -eq 0 -and $ctxNow -and $ctxNow.Subscription -and $ctxNow.Subscription.Id) {
+  $subs = @([pscustomobject]@{ Id = $ctxNow.Subscription.Id; Name="(current-context)"; State="Enabled" })
+  Write-Host "Fallback: using current context subscription $($ctxNow.Subscription.Id)"
+}
+
+Write-Host "Discovered subscriptions: $(@($subs).Count)"
+
+# ------------ Pull, Dedupe, Write ------------
+$totalNew = 0
+foreach ($s in $subs) {
+  try {
+    Write-Host ""
+    Write-Host ("--- [{0}] ({1}) ---------------------------------------------------" -f $s.Name,$s.Id)
+    Select-AzSubscription -SubscriptionId $s.Id | Out-Null
+
+    # Fetch Activity Logs
+    Write-Host "Get-AzActivityLog..."
+    $logs = $null
+    try {
+      $logs = Get-AzActivityLog -StartTime $from -EndTime $to -WarningAction SilentlyContinue |
+              Select-Object `
+                EventDataId,CorrelationId,OperationName,Status,Level,ResourceId,ResourceGroupName,SubscriptionId, `
+                Category,SubStatus,Caller,EventTimestamp,SubmissionTimestamp, `
+                ResourceProviderName,ResourceType,Resource, `
+                ActivityLogAlertId,ActivityStatus,ActivityStatusValue
+    } catch {
+      Write-Warning "Get-AzActivityLog error: $($_.Exception.Message)"
+      continue
+    }
+
+    $total = ($logs | Measure-Object).Count
+    Write-Host "Fetched: $total events"
+
+    # Load processed IDs
+    $indexPath = "indexes/subscription=$($s.Id)/processed_ids.txt"
+    $idxTxt    = Get-BlobText -Context $stCtx -Container $CONTAINER -BlobName $indexPath
+    $processed = @()
+    if ($idxTxt) { $processed = ($idxTxt -split "`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ } }
+    Write-Host "Index has $(@($processed).Count) EventDataIds"
+
+    # Dedupe in memory
+    $new = foreach ($e in $logs) { if ($e.EventDataId -and $processed -notcontains $e.EventDataId) { $e } }
+    $new = $new | Where-Object { $_ }
+    $newCount = ($new | Measure-Object).Count
+    Write-Host "New events after dedupe: $newCount"
+    if ($newCount -eq 0) { continue }
+
+    # Partition path
+    $yyyy = $dayUtc.ToString('yyyy'); $MM = $dayUtc.ToString('MM'); $dd = $dayUtc.ToString('dd')
+    $dir  = "activity/subscription=$($s.Id)/year=$yyyy/month=$MM/day=$dd"
+    $file = "$PREFIX" + "_$($dayUtc.ToString('yyyyMMdd')).csv"
+    $blob = "$dir/$file"
+    Write-Host "Target blob: $blob"
+
+    # Convert to CSV (sorted for readability)
+    $csvLines = $new | Sort-Object EventTimestamp | ConvertTo-Csv -NoTypeInformation
+
+    # Append or create
+    Append-Lines-ToBlob -Context $stCtx -Container $CONTAINER -BlobName $blob -Lines $csvLines
+
+    # Update index (union + sort unique)
+    $allIds = @($processed + ($new | Select-Object -Expand EventDataId)) | Sort-Object -Unique
+    Put-BlobText -Context $stCtx -Container $CONTAINER -BlobName $indexPath -Text ($allIds -join "`n")
+
+    $totalNew += $newCount
+    Write-Host "SUCCESS: wrote $newCount new rows"
+  } catch {
+    Write-Error ("[{0}] Outer error: {1}" -f $s.Id, ($_ | Out-String))
+  }
+}
+
+Write-Host ""
+Write-Host "Total new rows across subs: $totalNew"
+Write-Host "=== AuditTimer END $(Get-Date -Format u) ==="
+'@ | Set-Content -Path (Join-Path $timerDir 'run.ps1') -Encoding UTF8
+
+  # ZIP
+  $zip = Join-Path $PWD 'audit-timer.zip'
+  if (Test-Path $zip) { Remove-Item $zip -Force }
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  [IO.Compression.ZipFile]::CreateFromDirectory($root, $zip)
+
+  Write-Host "✅ Built $zip" -ForegroundColor Green
+}
+finally {
+  if (Test-Path $root) { Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue }
+}
