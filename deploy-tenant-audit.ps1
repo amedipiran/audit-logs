@@ -1,16 +1,12 @@
-# deploy-tenant-audit.ps1 — PowerShell 7+
 [CmdletBinding(PositionalBinding=$false)]
 param(
-  # Mandatory: scope sign-in to this tenant
   [Parameter(Mandatory)] [string] $TenantId,
-
   [Parameter(Mandatory)] [string] $NotificationEmail,
 
   [ValidateSet('westeurope','northeurope','swedencentral','uksouth','ukwest','francecentral','germanywestcentral','switzerlandnorth','eastus','eastus2','centralus','westus','westus2','westus3')]
   [string] $Location = 'swedencentral',
 
-  [string] $ArchiveResourceGroup = 'rg-audit-archive',
-  [string] $JobsResourceGroup = 'rg-audit-jobs',
+  [string] $ResourceGroup = 'rg-audit-log-exec',
   [string] $ContainerName = 'audit',
 
   # Built zip from build-audit-zip.ps1
@@ -25,8 +21,7 @@ $PSDefaultParameterValues['*:Confirm'] = $false
 function Initialize-Modules {
   $mods = @('Az.Accounts','Az.Resources','Az.Storage','Az.Monitor',
             'Az.Functions','Az.Websites','Az.ApplicationInsights','Az.OperationalInsights')
-  $need = @()
-  foreach($m in $mods){ if(-not (Get-Module -ListAvailable -Name $m)){ $need += $m } }
+  $need = @(); foreach($m in $mods){ if(-not (Get-Module -ListAvailable -Name $m)){ $need += $m } }
   if($need){ Install-Module -Name $need -Scope CurrentUser -Force -AllowClobber }
   foreach($m in $mods){ Import-Module $m -ErrorAction Stop }
 }
@@ -37,10 +32,10 @@ function Get-ShortHash([string]$s){
   ).Replace('-','').Substring(0,8).ToLower()
 }
 function Get-StableStorageName([string]$subId){
-  $raw=('staudit' + (Get-ShortHash $subId)).ToLower()
+  $raw=('stauditlogexec' + (Get-ShortHash $subId)).ToLower()
   if($raw.Length -gt 24){ $raw=$raw.Substring(0,24) }; $raw
 }
-function Get-StableFuncName([string]$subId){ "fn-audit-flex-" + (Get-ShortHash $subId) }
+function Get-StableFuncName([string]$subId){ "fn-audit-log-exec" + (Get-ShortHash $subId) }
 
 function Register-Provider([string]$ns){
   $rp = Get-AzResourceProvider -ProviderNamespace $ns -ErrorAction SilentlyContinue
@@ -124,9 +119,9 @@ function New-FlexFunctionApp([string]$homeSubId,[string]$rg,[string]$name,[strin
     -Payload (@{ identity = @{ type = "SystemAssigned" } } | ConvertTo-Json) | Out-Null
 
   Update-AzFunctionAppSetting -Name $name -ResourceGroupName $rg -AppSetting @{
-    'FUNCTIONS_WORKER_RUNTIME' = 'powershell'
-    'FUNCTIONS_EXTENSION_VERSION' = '~4'
-    'WEBSITE_TIME_ZONE' = 'W. Europe Standard Time'
+    'FUNCTIONS_WORKER_RUNTIME'     = 'powershell'
+    'FUNCTIONS_EXTENSION_VERSION'  = '~4'
+    'WEBSITE_TIME_ZONE'            = 'W. Europe Standard Time'
     'AzureWebJobsSecretStorageType' = 'files'
   } -Force | Out-Null
 
@@ -137,21 +132,15 @@ function New-ClassicFunctionApp([string]$rg,[string]$name,[string]$loc,[string]$
   $app = New-AzFunctionApp -Name $name -ResourceGroupName $rg -Location $loc `
           -StorageAccountName $storageName -OSType Linux -Runtime PowerShell -RuntimeVersion 7.4 -FunctionsVersion 4
   Update-AzFunctionAppSetting -Name $name -ResourceGroupName $rg -AppSetting @{
-    'WEBSITE_RUN_FROM_PACKAGE'      = '1'
+    'WEBSITE_RUN_FROM_PACKAGE'     = '1'
     'AzureWebJobsSecretStorageType' = 'files'
   } -Force | Out-Null
   $app
 }
 
 function Grant-RoleAssignment([string]$objectId,[string]$scope,[string]$role){
-  try{
-    $exists = Get-AzRoleAssignment -ObjectId $objectId -Scope $scope -RoleDefinitionName $role -ErrorAction SilentlyContinue
-    if(-not $exists){ New-AzRoleAssignment -ObjectId $objectId -Scope $scope -RoleDefinitionName $role | Out-Null }
-    return $true
-  } catch {
-    Write-Warning "Role assignment failed: role='$role' scope='$scope' objectId='$objectId' : $($_.Exception.Message)"
-    return $false
-  }
+  $exists = Get-AzRoleAssignment -ObjectId $objectId -Scope $scope -RoleDefinitionName $role -ErrorAction SilentlyContinue
+  if(-not $exists){ New-AzRoleAssignment -ObjectId $objectId -Scope $scope -RoleDefinitionName $role | Out-Null }
 }
 
 function Get-PublishingBasicAuth([string]$rg,[string]$name){
@@ -177,7 +166,7 @@ function Wait-LatestDeployment([hashtable]$hdr,[string]$name,[int]$timeoutSec=60
   $sw = [Diagnostics.Stopwatch]::StartNew()
   while($sw.Elapsed.TotalSeconds -lt $timeoutSec){
     $d = Invoke-RestMethod -Headers $hdr -Uri $uri -Method GET -ErrorAction SilentlyContinue
-    if($d -and $d.status -eq 4){ return $true }
+    if($d -and $d.status -eq 4){ return $true }  
     Start-Sleep -Seconds 3
   }
   return $false
@@ -189,66 +178,9 @@ function Sync-FunctionTriggers([string]$sub,[string]$rg,[string]$name){
     --url "https://management.azure.com/subscriptions/$sub/resourceGroups/$rg/providers/Microsoft.Web/sites/$name/syncfunctiontriggers?api-version=$api" | Out-Null
 }
 
-function Add-PortalCors([string]$sub,[string]$rg,[string]$fn){
-  az functionapp cors add -g $rg -n $fn --subscription $sub --allowed-origins https://portal.azure.com    | Out-Null
-  az functionapp cors add -g $rg -n $fn --subscription $sub --allowed-origins https://ms.portal.azure.com | Out-Null
-}
-
-function Resolve-ClientIp {
-  $cands = @(
-    'https://api.ipify.org',
-    'https://ifconfig.me'
-  )
-  foreach($u in $cands){
-    try{
-      $ip = (Invoke-RestMethod -Uri $u -Method GET -TimeoutSec 10).ToString().Trim()
-      if($ip -match '^\d{1,3}(\.\d{1,3}){3}$'){ return $ip }
-    } catch {}
-  }
-  Write-Warning "Could not resolve public client IP; continuing without client IP allow rule."
-  return $null
-}
-
-function Ensure-AzCliSubscription([string]$subId){
-  try{
-    az account set --subscription $subId --only-show-errors | Out-Null
-  } catch {
-    Write-Warning "az account set failed for $subId ($($_.Exception.Message))"
-  }
-}
-
-function Add-PortalNetworkAccess([string]$sub,[string]$rg,[string]$fn){
-  Ensure-AzCliSubscription $sub
-
-  az webapp config access-restriction add -g $rg -n $fn --subscription $sub `
-    --rule-name "Allow-AzureCloud" --priority 100 --action Allow --service-tag AzureCloud `
-    --only-show-errors 2>$null | Out-Null
-
-  az webapp config access-restriction add -g $rg -n $fn --subscription $sub `
-    --scm-site true --rule-name "Allow-AzureCloud-SCM" --priority 100 --action Allow --service-tag AzureCloud `
-    --only-show-errors 2>$null | Out-Null
-
-  $ip = Resolve-ClientIp
-  if($ip){
-    az webapp config access-restriction add -g $rg -n $fn --subscription $sub `
-      --rule-name "Allow-ClientIP" --priority 90 --action Allow --ip-address "$ip/32" `
-      --only-show-errors 2>$null | Out-Null
-
-    az webapp config access-restriction add -g $rg -n $fn --subscription $sub `
-      --scm-site true `
-      --rule-name "Allow-ClientIP-SCM" --priority 90 --action Allow --ip-address "$ip/32" `
-      --only-show-errors 2>$null | Out-Null
-  }
-
-  Update-AzFunctionAppSetting -Name $fn -ResourceGroupName $rg -AppSetting @{
-    'SCM_BASIC_AUTH_DISABLED' = '0'
-  } -Force | Out-Null
-}
-
-function Enable-AppLogStreaming([string]$sub,[string]$rg,[string]$fn){
-  Ensure-AzCliSubscription $sub
-  az webapp log config -g $rg -n $fn --subscription $sub `
-    --application-logging filesystem --level information | Out-Null
+function Add-PortalCors([string]$rg,[string]$fn){
+  az functionapp cors add -g $rg -n $fn --allowed-origins https://portal.azure.com    | Out-Null
+  az functionapp cors add -g $rg -n $fn --allowed-origins https://ms.portal.azure.com | Out-Null
 }
 
 function Get-HostKeys([string]$sub,[string]$rg,[string]$fn){
@@ -269,13 +201,15 @@ function Get-HostKeys([string]$sub,[string]$rg,[string]$fn){
   $keys = & $tryList
   if($keys){ return $keys }
 
+  # warmup
   Sync-FunctionTriggers -sub $sub -rg $rg -name $fn
-  az webapp restart -g $rg -n $fn --subscription $sub | Out-Null
+  az webapp restart -g $rg -n $fn | Out-Null
   Start-Sleep -Seconds 10
 
   $keys = & $tryList
   if($keys){ return $keys }
 
+  # Create a master key if missing
   $newKey = -join ((48..57+65..90+97..122) | Get-Random -Count 64 | % {[char]$_})
   $setUrl = "https://management.azure.com/subscriptions/$sub/resourceGroups/$rg/providers/Microsoft.Web/sites/$fn/host/default/setmasterkey?api-version=$api"
   try {
@@ -289,6 +223,8 @@ function Get-HostKeys([string]$sub,[string]$rg,[string]$fn){
   Write-Warning "Host keys still unavailable after init attempts."
   return $null
 }
+
+# Ensure Log Analytics + App Insights and wire invocations 
 
 function Set-LogAnalyticsWorkspace([string]$rg,[string]$loc,[string]$name){
   $ws = Get-AzOperationalInsightsWorkspace -ResourceGroupName $rg -Name $name -ErrorAction SilentlyContinue
@@ -315,73 +251,77 @@ function Set-AppInsights([string]$rg,[string]$loc,[string]$name,[string]$workspa
 
 Initialize-Modules
 
-# Sign in
-$ctx = Get-AzContext -ErrorAction SilentlyContinue
-if(-not $ctx -or -not $ctx.Tenant -or $ctx.Tenant.Id -ne $TenantId){
-  Connect-AzAccount -Tenant $TenantId | Out-Null
+try { Disconnect-AzAccount -Scope Process -ErrorAction SilentlyContinue } catch {}
+try { Clear-AzContext -Scope Process -Force -ErrorAction SilentlyContinue } catch {}
+Disable-AzContextAutosave -Scope Process | Out-Null
+
+Connect-AzAccount -Tenant $TenantId | Out-Null
+
+$allSubs = Get-AzSubscription -TenantId $TenantId | Where-Object { $_.State -eq 'Enabled' } | Sort-Object -Property Name
+if(-not $allSubs){ throw "No Enabled subscriptions in tenant $TenantId" }
+
+Write-Host ""
+Write-Host "Available subscriptions in tenant $TenantId" -ForegroundColor Cyan
+for($i=0;$i -lt $allSubs.Count;$i++){
+  "{0,3}. {1,-44} {2}" -f ($i+1), $allSubs[$i].Name, $allSubs[$i].Id | Write-Host
 }
+$pick = Read-Host "Select a subscription number"
+if(-not ($pick -as [int]) -or $pick -lt 1 -or $pick -gt $allSubs.Count){ throw "Invalid selection." }
+$chosen = $allSubs[$pick-1]
 
-# Collect enabled subs in tenant
-$subs = Get-AzSubscription -TenantId $TenantId | Where-Object { $_.State -eq 'Enabled' } | Sort-Object -Property Name
-if(-not $subs){ throw "No Enabled subscriptions in tenant $TenantId" }
+Set-AzContext -SubscriptionId $chosen.Id -Tenant $TenantId | Out-Null
+try {
+  az account clear --only-show-errors | Out-Null
+  az login --tenant $TenantId --use-device-code --only-show-errors 1>$null
+  az account set --subscription $chosen.Id --only-show-errors | Out-Null
+} catch {}
 
-# Home sub for shared resources
-$HomeSubId = $subs[0].Id
-Set-AzContext -SubscriptionId $HomeSubId | Out-Null
-Write-Host "🏠 Home subscription: $($subs[0].Name) ($HomeSubId)"
+$HomeSubId = $chosen.Id
+Write-Host "🏠 Deployment subscription (chosen): $($chosen.Name) ($HomeSubId)"
 
-# Providers (home sub)
 'Microsoft.Web','Microsoft.Storage','Microsoft.Insights','Microsoft.OperationalInsights' | ForEach-Object { Register-Provider $_ }
 
-# Resource groups (home sub)
-$rgArchive = Get-ResourceGroup -name $ArchiveResourceGroup -loc $Location
-$rgJobs    = Get-ResourceGroup -name $JobsResourceGroup    -loc $Location
+$rgArchive = Get-ResourceGroup -name $ResourceGroup -loc $Location
 
-# Shared storage (home sub)
 $stName = Get-StableStorageName -subId $HomeSubId
-$st     = Get-StorageAccount -rg $ArchiveResourceGroup -loc $Location -name $stName -AllowSharedKey:$false
+$st     = Get-StorageAccount -rg $ResourceGroup -loc $Location -name $stName -AllowSharedKey:$false
 Set-ContainerAAD -stName $st.StorageAccountName -container $ContainerName
-Set-LifecycleArchivePolicy -rg $ArchiveResourceGroup -stName $st.StorageAccountName -prefix $ContainerName
+Set-LifecycleArchivePolicy -rg $ResourceGroup -stName $st.StorageAccountName -prefix $ContainerName
 
-# Action group (home sub)
-Set-ActionGroup -homeSubId $HomeSubId -rg $ArchiveResourceGroup -email $NotificationEmail
+Set-ActionGroup -homeSubId $HomeSubId -rg $ResourceGroup -email $NotificationEmail
 
-# Enable Subscription Activity Logs -> Storage on each sub
-foreach($s in $subs){
+foreach($s in $allSubs){
   try{
     Enable-SubscriptionActivityLogsToStorage -subscriptionId $s.Id -stResourceId $st.Id
     Write-Host "📝 Activity Logs → Storage enabled for $($s.Name)"
   } catch { Write-Warning "Failed enabling diagnostics on $($s.Name): $($_.Exception.Message)" }
 }
 
-# Function App (home sub)
 $fnName = Get-StableFuncName -subId $HomeSubId
 Write-Host "🔧 Creating FLEX Function App..."
 $site = $null
 try {
-  $site = New-FlexFunctionApp -homeSubId $HomeSubId -rg $JobsResourceGroup -name $fnName -loc $Location
+  $site = New-FlexFunctionApp -homeSubId $HomeSubId -rg $ResourceGroup -name $fnName -loc $Location
   Write-Host "⚙️  Flex Function App created: $fnName"
 } catch {
   Write-Warning "Flex create failed: $($_.Exception.Message)"
   Write-Warning "Falling back to Linux Consumption…"
   $funcStName = ("stfunc" + (Get-ShortHash $HomeSubId)).ToLower()
   if($funcStName.Length -gt 24){ $funcStName = $funcStName.Substring(0,24) }
-  $funcSt = Get-StorageAccount -rg $JobsResourceGroup -loc $Location -name $funcStName -AllowSharedKey:$true
-  $site = New-ClassicFunctionApp -rg $JobsResourceGroup -name $fnName -loc $Location -storageName $funcSt.StorageAccountName
+  $funcSt = Get-StorageAccount -rg $ResourceGroup -loc $Location -name $funcStName -AllowSharedKey:$true
+  $site = New-ClassicFunctionApp -rg $ResourceGroup -name $fnName -loc $Location -storageName $funcSt.StorageAccountName
   Write-Host "⚙️  Linux Consumption Function App created: $fnName"
 }
 
-# Ensure MSI
-$siteNow = Get-AzWebApp -Name $fnName -ResourceGroupName $JobsResourceGroup
+$siteNow = Get-AzWebApp -Name $fnName -ResourceGroupName $ResourceGroup
 if(-not $siteNow.Identity -or $siteNow.Identity.Type -ne 'SystemAssigned'){
-  Set-AzWebApp -Name $fnName -ResourceGroupName $JobsResourceGroup -AssignIdentity $true | Out-Null
-  $siteNow = Get-AzWebApp -Name $fnName -ResourceGroupName $JobsResourceGroup
+  Set-AzWebApp -Name $fnName -ResourceGroupName $ResourceGroup -AssignIdentity $true | Out-Null
+  $siteNow = Get-AzWebApp -Name $fnName -ResourceGroupName $ResourceGroup
 }
 $miPrincipalId = $siteNow.Identity.PrincipalId
 
-# App settings (job config)
-Update-AzFunctionAppSetting -Name $fnName -ResourceGroupName $JobsResourceGroup -AppSetting @{
-  'AUDIT_RG'          = $ArchiveResourceGroup
+Update-AzFunctionAppSetting -Name $fnName -ResourceGroupName $ResourceGroup -AppSetting @{
+  'AUDIT_RG'          = $ResourceGroup
   'AUDIT_ST_ACCOUNT'  = $st.StorageAccountName
   'AUDIT_CONTAINER'   = $ContainerName
   'AUDIT_PREFIX'      = 'AzActivity'
@@ -390,61 +330,50 @@ Update-AzFunctionAppSetting -Name $fnName -ResourceGroupName $JobsResourceGroup 
   'WEBSITE_TIME_ZONE' = 'W. Europe Standard Time'
 } -Force | Out-Null
 
-# Use MI for AzureWebJobsStorage
-Update-AzFunctionAppSetting -ResourceGroupName $JobsResourceGroup -Name $fnName -AppSetting @{
+Update-AzFunctionAppSetting -ResourceGroupName $ResourceGroup -Name $fnName -AppSetting @{
   "AzureWebJobsStorage__blobServiceUri" = "https://$($st.StorageAccountName).blob.core.windows.net"
   "AzureWebJobsStorage__queueServiceUri" = "https://$($st.StorageAccountName).queue.core.windows.net"
   "AzureWebJobsStorage__credential"      = "managedidentity"
 } -Force | Out-Null
 
-# Grant MI data access on archive storage (fails if role lacks permission)
-$failedGrants = @()
-$stScope = "/subscriptions/$HomeSubId/resourceGroups/$ArchiveResourceGroup/providers/Microsoft.Storage/storageAccounts/$($st.StorageAccountName)"
-if(-not (Grant-RoleAssignment -objectId $miPrincipalId -scope $stScope -role 'Storage Blob Data Contributor')){
-  $failedGrants += "Storage Blob Data Contributor@$stScope"
-}
+$stScope = "/subscriptions/$HomeSubId/resourceGroups/$ResourceGroup/providers/Microsoft.Storage/storageAccounts/$($st.StorageAccountName)"
+Grant-RoleAssignment -objectId $miPrincipalId -scope $stScope -role 'Storage Blob Data Contributor'
 
-# Reader/Monitoring Reader on every subscription (continue on forbidden)
-foreach($s in $subs){
+foreach($s in $allSubs){
   $scope="/subscriptions/$($s.Id)"
-  $ok1 = Grant-RoleAssignment -objectId $miPrincipalId -scope $scope -role 'Reader'
-  $ok2 = Grant-RoleAssignment -objectId $miPrincipalId -scope $scope -role 'Monitoring Reader'
-  if(-not ($ok1 -and $ok2)){ $failedGrants += "$($s.Id):Reader+MonitoringReader" }
+  Grant-RoleAssignment -objectId $miPrincipalId -scope $scope -role 'Reader'
+  Grant-RoleAssignment -objectId $miPrincipalId -scope $scope -role 'Monitoring Reader'
 }
 
-# Observability
 $wsName  = "law-audit"
 $aiName  = "appi-" + $fnName
-$ws = Set-LogAnalyticsWorkspace -rg $JobsResourceGroup -loc $Location -name $wsName
-$ai = Set-AppInsights         -rg $JobsResourceGroup -loc $Location -name $aiName -workspaceResourceId $ws.ResourceId
+
+$ws = Set-LogAnalyticsWorkspace -rg $ResourceGroup -loc $Location -name $wsName
+$ai = Set-AppInsights -rg $ResourceGroup -loc $Location -name $aiName -workspaceResourceId $ws.ResourceId
+
 if($ai.ConnectionString){
-  Update-AzFunctionAppSetting -Name $fnName -ResourceGroupName $JobsResourceGroup -AppSetting @{
+  Update-AzFunctionAppSetting -Name $fnName -ResourceGroupName $ResourceGroup -AppSetting @{
     'APPLICATIONINSIGHTS_CONNECTION_STRING' = $ai.ConnectionString
-    'APPINSIGHTS_PROFILERFEATURE_VERSION'   = '1.0.0'
-    'APPINSIGHTS_SNAPSHOTFEATURE_VERSION'   = '1.0.0'
-    'DiagnosticServices_EXTENSION_VERSION'  = '~3'
+    'APPINSIGHTS_PROFILERFEATURE_VERSION' = '1.0.0'
+    'APPINSIGHTS_SNAPSHOTFEATURE_VERSION' = '1.0.0'
+    'DiagnosticServices_EXTENSION_VERSION' = '~3'
     'XDT_MicrosoftApplicationInsights_Mode' = 'recommended'
   } -Force | Out-Null
 }
 
-# Cors for testing
-Add-PortalCors          -sub $HomeSubId -rg $JobsResourceGroup -fn $fnName
-Add-PortalNetworkAccess -sub $HomeSubId -rg $JobsResourceGroup -fn $fnName
-Enable-AppLogStreaming  -sub $HomeSubId -rg $JobsResourceGroup -fn $fnName
+Add-PortalCors -rg $ResourceGroup -fn $fnName
 
-# Deploy code
 if(-not (Test-Path $ZipPath)){ throw "Zip not found: $ZipPath. Run build-audit-zip.ps1 first." }
-$hdr = ZipDeploy -rg $JobsResourceGroup -name $fnName -zipPath $ZipPath
+$hdr = ZipDeploy -rg $ResourceGroup -name $fnName -zipPath $ZipPath
 if(-not (Wait-LatestDeployment -hdr $hdr -name $fnName -timeoutSec 600)){
   throw "ZipDeploy did not reach Success within timeout."
 }
 
-# Warmup & keys
 $currSub = (Get-AzContext).Subscription.Id
-Sync-FunctionTriggers -sub $currSub -rg $JobsResourceGroup -name $fnName
-az webapp restart -g $JobsResourceGroup -n $fnName --subscription $currSub | Out-Null
+Sync-FunctionTriggers -sub $currSub -rg $ResourceGroup -name $fnName
+az webapp restart -g $ResourceGroup -n $fnName | Out-Null
 
-$keys = Get-HostKeys -sub $currSub -rg $JobsResourceGroup -fn $fnName
+$keys = Get-HostKeys -sub $currSub -rg $ResourceGroup -fn $fnName
 if($keys -and $keys.masterKey){
   Write-Host "✅ Host master key is available." -ForegroundColor Green
 } else {
@@ -453,14 +382,8 @@ if($keys -and $keys.masterKey){
 
 Write-Host ""
 Write-Host "✅ Deployment complete" -ForegroundColor Green
-Write-Host "Function App:   $fnName  (RG: $JobsResourceGroup)"
-Write-Host "Storage:        $($st.StorageAccountName)  (RG: $ArchiveResourceGroup)  Container: $ContainerName"
-Write-Host "App Insights:   $aiName  (RG: $JobsResourceGroup)"
-Write-Host "Workspace:      $wsName  (RG: $JobsResourceGroup)"
+Write-Host "Function App:   $fnName  (RG: $ResourceGroup)"
+Write-Host "Storage:        $($st.StorageAccountName)  (RG: $ResourceGroup)  Container: $ContainerName"
+Write-Host "App Insights:   $aiName  (RG: $ResourceGroup)"
+Write-Host "Workspace:      $wsName  (RG: $ResourceGroup)"
 Write-Host "MI ObjectId:    $miPrincipalId"
-
-if($failedGrants.Count -gt 0){
-  Write-Host ""
-  Write-Host "⚠️  Role grants FAILED on (function will skip these subs at runtime):" -ForegroundColor Yellow
-  Write-Host "   " ($failedGrants -join "`n   ")
-}
