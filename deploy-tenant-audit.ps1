@@ -9,6 +9,8 @@ param(
   [string] $ResourceGroup = 'rg-audit-log-exec',
   [string] $ContainerName = 'audit',
 
+  [int] $DaysToArchive = 91,
+
   # Built zip from build-audit-zip.ps1
   [string] $ZipPath = '.\audit-timer.zip'
 )
@@ -68,10 +70,25 @@ function Set-ContainerAAD($stName,[string]$container){
 }
 
 function Set-LifecycleArchivePolicy([string]$rg,[string]$stName,[string]$prefix){
-  $action = Add-AzStorageAccountManagementPolicyAction -BaseBlobAction TierToArchive -DaysAfterModificationGreaterThan 91
-  $filter = New-AzStorageAccountManagementPolicyFilter -PrefixMatch @("$prefix/") -BlobType blockBlob
-  $rule   = New-AzStorageAccountManagementPolicyRule -Name 'archive-after-91' -Action $action -Filter $filter
-  Set-AzStorageAccountManagementPolicy -ResourceGroupName $rg -StorageAccountName $stName -Rule $rule | Out-Null
+  $action = Add-AzStorageAccountManagementPolicyAction `
+    -BaseBlobAction TierToArchive `
+    -DaysAfterModificationGreaterThan $DaysToArchive
+
+  $filter = New-AzStorageAccountManagementPolicyFilter `
+    -PrefixMatch @("$prefix/") `
+    -BlobType blockBlob
+
+  $ruleName = "archive-after-$DaysToArchive"
+
+  $rule = New-AzStorageAccountManagementPolicyRule `
+    -Name  $ruleName `
+    -Action $action `
+    -Filter $filter
+
+  Set-AzStorageAccountManagementPolicy `
+    -ResourceGroupName  $rg `
+    -StorageAccountName $stName `
+    -Rule $rule | Out-Null
 }
 
 function Enable-SubscriptionActivityLogsToStorage([string]$subscriptionId,[string]$stResourceId){

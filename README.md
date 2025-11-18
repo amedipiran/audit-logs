@@ -67,6 +67,25 @@ The script ensures these are registered:
 - `Microsoft.Insights`
 - `Microsoft.OperationalInsights`
 
+
+### 5) Viewing logs requires a Global Administrator role
+
+To view the archived audit logs inside the storage account container, a user must be assigned “Storage Blob Data Reader” on that storage account.
+
+**⚠️ Important:**
+In Azure AD (Entra ID), only a Global Administrator is allowed to assign Azure RBAC roles that grant data-plane access on Storage Accounts (e.g., Storage Blob Data Reader).
+
+Even if you are Owner on the subscription or the storage account, you cannot grant yourself (or others) this role unless you also have the Global Administrator directory role.
+
+This means:
++ The Global Admin must go to
+**Storage Account** → **Access Control (IAM)** → **Add Role Assignment**
++ Choose **Storage Blob Data Reader**
++	Assign it to the user needing log access
++	After this, the user can browse the logs in **Containers** → **audit**
+
+Without this, the user will see “You don’t have permission” even if they are an Owner on the subscription.
+
 ---
 
 ## REST/ARM APIs used by the script
@@ -90,6 +109,8 @@ These are invoked via `Invoke-AzRestMethod` or `az rest`:
 
 > **Log Analytics Workspace** and **Application Insights** are primarily created via Az cmdlets. App Insights is workspace-based (`-WorkspaceResourceId`). Newer Az versions will change output types for `Get/New-AzApplicationInsights` (the script remains compatible).
 
+
+### 5)  
 ---
 
 ## Build first: package your functions
