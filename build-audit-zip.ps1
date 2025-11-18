@@ -1,6 +1,7 @@
 [CmdletBinding(PositionalBinding=$false)]
 param(
-  [string] $Cron = '0 30 16 * * *'
+  # This runs every sixth hour
+  [string] $Cron = '0 0 */6 * * *'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -204,7 +205,7 @@ foreach ($s in $subs) {
     Write-Host "Fetched: $total events"
 
     # Load processed IDs
-    $indexPath = "indexes/subscription=$($s.Id)/processed_ids.txt"
+    $indexPath = "indexes/$($s.Id)/processed_ids.txt"
     $idxTxt    = Get-BlobText -Context $stCtx -Container $CONTAINER -BlobName $indexPath
     $processed = @()
     if ($idxTxt) { $processed = ($idxTxt -split "`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ } }
@@ -219,7 +220,7 @@ foreach ($s in $subs) {
 
     # Partition path
     $yyyy = $dayUtc.ToString('yyyy'); $MM = $dayUtc.ToString('MM'); $dd = $dayUtc.ToString('dd')
-    $dir  = "activity/subscription=$($s.Id)/year=$yyyy/month=$MM/day=$dd"
+    $dir  = "activity/$($s.Id)/$yyyy/$MM/$dd"
     $file = "$PREFIX" + "_$($dayUtc.ToString('yyyyMMdd')).csv"
     $blob = "$dir/$file"
     Write-Host "Target blob: $blob"
