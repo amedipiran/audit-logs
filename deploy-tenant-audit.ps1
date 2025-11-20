@@ -11,6 +11,8 @@ param(
 
   [int] $DaysToArchive = 91,
 
+  [int] $DaysToDelete  = 91,
+
   # Built zip from build-audit-zip.ps1
   [string] $ZipPath = '.\audit-timer.zip'
 )
@@ -92,18 +94,25 @@ function Set-ContainerAAD($stName,[string]$container){
 }
 
 function Set-LifecycleArchivePolicy([string]$rg,[string]$stName,[string]$prefix){
+  $deleteAfter = $DaysToArchive + $DaysToDelete
+
   $action = Add-AzStorageAccountManagementPolicyAction `
     -BaseBlobAction TierToArchive `
     -DaysAfterModificationGreaterThan $DaysToArchive
+
+  $action = Add-AzStorageAccountManagementPolicyAction `
+    -InputObject $action `
+    -BaseBlobAction Delete `
+    -DaysAfterModificationGreaterThan $deleteAfter
 
   $filter = New-AzStorageAccountManagementPolicyFilter `
     -PrefixMatch @("$prefix/") `
     -BlobType blockBlob
 
-  $ruleName = "archive-after-$DaysToArchive"
+  $ruleName = "archive-$DaysToArchive-delete-$deleteAfter"
 
   $rule = New-AzStorageAccountManagementPolicyRule `
-    -Name  $ruleName `
+    -Name   $ruleName `
     -Action $action `
     -Filter $filter
 
@@ -358,7 +367,6 @@ Write-Host "🏠 Deployment subscription (chosen): $($chosen.Name) ($HomeSubId)"
 'Microsoft.Web','Microsoft.Storage','Microsoft.Insights','Microsoft.OperationalInsights' |
   ForEach-Object { Register-Provider $_ }
 
-# Se bara till att RG finns – returvärdet används inte
 Get-ResourceGroup -name $ResourceGroup -loc $Location | Out-Null
 
 $stName = Get-StableStorageName -subId $HomeSubId
