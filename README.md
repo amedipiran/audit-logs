@@ -137,7 +137,9 @@ pwsh ./deploy-tenant-audit.ps1 `
   -Location "swedencentral" `
   -ResourceGroup "rg-audit-log-exec" `
   -ContainerName "audit" `
-  -ZipPath ".\audit-timer.zip"
+  -ZipPath ".\audit-timer.zip" `
+  -DaysToArchive 91 `
+  -DaysToDelete 91
 ```
 
 ### ⚠️ Important — Subscription Selection During Login
