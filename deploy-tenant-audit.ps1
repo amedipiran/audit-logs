@@ -56,7 +56,7 @@ function Get-StableStorageName([string]$subId){
 }
 
 function Get-StableFuncName([string]$subId){
-  "fn-audit-log-exec" + (Get-ShortHash $subId)
+  "fn-audit-log-exec-" + (Get-ShortHash $subId)
 }
 
 function Register-Provider([string]$ns){
@@ -150,6 +150,7 @@ function Enable-SubscriptionActivityLogsToStorage([string]$subscriptionId,[strin
 
 function Set-ActionGroup([string]$homeSubId,[string]$rg,[string]$email){
   $id = "/subscriptions/$homeSubId/resourceGroups/$rg/providers/microsoft.insights/actionGroups/ag-audit-email"
+
   $payload = @{
     location   = 'global'
     properties = @{
@@ -164,6 +165,49 @@ function Set-ActionGroup([string]$homeSubId,[string]$rg,[string]$email){
   } | ConvertTo-Json -Depth 8
 
   Invoke-AzRestMethod -Method PUT -Path ($id + '?api-version=2021-09-01') -Payload $payload | Out-Null
+  return $id
+}
+
+Import-Module Az.Monitor -Force
+
+function Set-AuditFailureAlert([string]$homeSubId,[string]$rg,[string]$fnName,[string]$actionGroupId){
+  $alertName = 'audit-fn-failures'
+  $scope     = "/subscriptions/$homeSubId"
+  $fnResourceId = "/subscriptions/$homeSubId/resourceGroups/$rg/providers/Microsoft.Web/sites/$fnName"
+
+  Write-Host "---- Creating Activity Log Alert (cmdlet) ----"
+  Write-Host "AlertName:  $alertName"
+  Write-Host "Scope:      $scope"
+  Write-Host "FunctionId: $fnResourceId"
+  Write-Host "ActionGrp:  $actionGroupId"
+  Write-Host "----------------------------------------------"
+
+  $ag = New-AzActivityLogAlertActionGroupObject -Id $actionGroupId
+
+  $condCategory = New-AzActivityLogAlertAlertRuleAnyOfOrLeafConditionObject `
+    -Field "category" `
+    -Equal "Administrative"
+
+  $condStatus = New-AzActivityLogAlertAlertRuleAnyOfOrLeafConditionObject `
+    -Field "status" `
+    -Equal "Failed"
+
+  $condResource = New-AzActivityLogAlertAlertRuleAnyOfOrLeafConditionObject `
+    -Field "resourceId" `
+    -Equal $fnResourceId
+
+  $result = New-AzActivityLogAlert `
+    -Name $alertName `
+    -ResourceGroupName $rg `
+    -Location "global" `
+    -Scope @($scope) `
+    -Action @($ag) `
+    -Condition @($condCategory, $condStatus, $condResource) `
+    -Enabled $true `
+    -Description "Alert on failed management operations for the audit Function App"
+
+  Write-Host "✅ Activity Log Alert created/updated (cmdlet)."
+  Write-Host "Result Id: $($result.Id)"
 }
 
 function New-FlexFunctionApp([string]$homeSubId,[string]$rg,[string]$name,[string]$loc){
@@ -208,9 +252,39 @@ function New-ClassicFunctionApp([string]$rg,[string]$name,[string]$loc,[string]$
 }
 
 function Grant-RoleAssignment([string]$objectId,[string]$scope,[string]$role){
-  $exists = Get-AzRoleAssignment -ObjectId $objectId -Scope $scope -RoleDefinitionName $role -ErrorAction SilentlyContinue
-  if(-not $exists){
-    New-AzRoleAssignment -ObjectId $objectId -Scope $scope -RoleDefinitionName $role | Out-Null
+  if ([string]::IsNullOrWhiteSpace($objectId)) {
+    Write-Error "Grant-RoleAssignment: objectId is empty for scope '$scope' and role '$role'"
+    return
+  }
+
+  Write-Host "Grant-RoleAssignment: scope='$scope', role='$role', objectId='$objectId'"
+
+  $exists = Get-AzRoleAssignment `
+    -ObjectId $objectId `
+    -Scope $scope `
+    -RoleDefinitionName $role `
+    -ErrorAction SilentlyContinue
+
+  if ($exists) {
+    Write-Host "  -> Role '$role' already assigned on '$scope'"
+    return
+  }
+
+  try {
+    New-AzRoleAssignment `
+      -ObjectId $objectId `
+      -Scope $scope `
+      -RoleDefinitionName $role `
+      -ErrorAction Stop | Out-Null
+
+    Write-Host "  -> Role '$role' granted on '$scope'"
+  }
+  catch {
+    Write-Error ("  -> Failed to grant role '{0}' on '{1}': {2}" -f $role, $scope, $_.Exception.Message)
+    if ($_.Exception.Response -and $_.Exception.Response.Content) {
+      Write-Host "  -> Details: $($_.Exception.Response.Content)" 
+    }
+    throw
   }
 }
 
@@ -375,7 +449,7 @@ $st     = Get-StorageAccount -rg $ResourceGroup -loc $Location -name $stName -Al
 Set-ContainerAAD          -stName $st.StorageAccountName -container $ContainerName
 Set-LifecycleArchivePolicy -rg $ResourceGroup -stName $st.StorageAccountName -prefix $ContainerName
 
-Set-ActionGroup -homeSubId $HomeSubId -rg $ResourceGroup -email $NotificationEmail
+$actionGroupId = Set-ActionGroup -homeSubId $HomeSubId -rg $ResourceGroup -email $NotificationEmail
 
 # Raw activity logs from azure
 <# foreach($s in $allSubs){
@@ -457,6 +531,8 @@ if($ai.ConnectionString){
 }
 
 Add-PortalCors -rg $ResourceGroup -fn $fnName
+
+Set-AuditFailureAlert -homeSubId $HomeSubId -rg $ResourceGroup -fnName $fnName -actionGroupId $actionGroupId
 
 if(-not (Test-Path $ZipPath)){
   throw "Zip not found: $ZipPath. Run build-audit-zip.ps1 first."
