@@ -57,7 +57,6 @@ $ProgressPreference    = "SilentlyContinue"
 Write-Host "=== AuditTimer START $(Get-Date -Format u) ==="
 if ($Timer.IsPastDue) { Write-Warning "Timer is running late." }
 
-# Helpers 
 function Get-BlobText {
   param([object]$Context, [string]$Container, [string]$BlobName)
   try {
@@ -99,7 +98,6 @@ function Append-Lines-ToBlob {
     } catch {}
 
     if ($exists) {
-      # Skip header on append
       $Lines | Select-Object -Skip 1 | Add-Content -Path $tmp -Encoding UTF8
     } else {
       $Lines | Set-Content -Path $tmp -Encoding UTF8
@@ -111,7 +109,6 @@ function Append-Lines-ToBlob {
   }
 }
 
-# ------------ Environment / Settings ------------
 $RG          = $env:AUDIT_RG
 $ST_ACCOUNT  = $env:AUDIT_ST_ACCOUNT
 $CONTAINER   = $env:AUDIT_CONTAINER
@@ -125,7 +122,6 @@ if ([string]::IsNullOrWhiteSpace($RG) -or
   throw "Missing settings: AUDIT_RG='$RG' AUDIT_ST_ACCOUNT='$ST_ACCOUNT' AUDIT_CONTAINER='$CONTAINER'"
 }
 
-# Auth & Storage Context
 Import-Module Az.Accounts
 Import-Module Az.Resources
 Import-Module Az.Monitor
@@ -145,25 +141,21 @@ if ($HOME_SUB) {
   }
 }
 
-# Use AAD to access Storage (no keys)
 $stObj = Get-AzStorageAccount -ResourceGroupName $RG -Name $ST_ACCOUNT
 if (-not $stObj) { throw "Storage account not found: RG=$RG Name=$ST_ACCOUNT" }
 $stCtx = New-AzStorageContext -StorageAccountName $ST_ACCOUNT -UseConnectedAccount
 
-# Ensure the target container exists
 if (-not (Get-AzStorageContainer -Context $stCtx -Name $CONTAINER -ErrorAction SilentlyContinue)) {
   New-AzStorageContainer -Name $CONTAINER -Context $stCtx -Permission Off | Out-Null
   Write-Host "Created container '$CONTAINER'"
 }
 
-# ------------ Time Window (UTC: today → now) ------------
 $nowUtc = (Get-Date).ToUniversalTime()
 $dayUtc = $nowUtc.Date
 $from   = $dayUtc
 $to     = $nowUtc
 Write-Host "Query window: $($from.ToString('u')) → $($to.ToString('u'))"
 
-# ------------ Discover Subscriptions ------------
 $subs = @()
 try {
   $subs = Get-AzSubscription -ErrorAction Stop | Where-Object { $_.State -eq 'Enabled' }
@@ -178,7 +170,6 @@ if (($subs | Measure-Object).Count -eq 0 -and $ctxNow -and $ctxNow.Subscription 
 
 Write-Host "Discovered subscriptions: $(@($subs).Count)"
 
-# ------------ Pull, Dedupe, Write ------------
 $totalNew = 0
 foreach ($s in $subs) {
   try {
@@ -186,7 +177,6 @@ foreach ($s in $subs) {
     Write-Host ("--- [{0}] ({1}) ---------------------------------------------------" -f $s.Name,$s.Id)
     Select-AzSubscription -SubscriptionId $s.Id | Out-Null
 
-    # Fetch Activity Logs
     Write-Host "Get-AzActivityLog..."
     $logs = $null
     try {
@@ -204,39 +194,54 @@ foreach ($s in $subs) {
     $total = ($logs | Measure-Object).Count
     Write-Host "Fetched: $total events"
 
-    # Load processed IDs
     $indexPath = "indexes/$($s.Id)/processed_ids.txt"
     $idxTxt    = Get-BlobText -Context $stCtx -Container $CONTAINER -BlobName $indexPath
     $processed = @()
-    if ($idxTxt) { $processed = ($idxTxt -split "`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ } }
+    if ($idxTxt) { 
+      $processed = ($idxTxt -split "`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ } 
+    }
     Write-Host "Index has $(@($processed).Count) EventDataIds"
 
-    # Dedupe in memory
-    $new = foreach ($e in $logs) { if ($e.EventDataId -and $processed -notcontains $e.EventDataId) { $e } }
+    $new = foreach ($e in $logs) { 
+      if ($e.EventDataId -and $processed -notcontains $e.EventDataId) { $e } 
+    }
     $new = $new | Where-Object { $_ }
     $newCount = ($new | Measure-Object).Count
     Write-Host "New events after dedupe: $newCount"
     if ($newCount -eq 0) { continue }
 
-    # Partition path
-    $yyyy = $dayUtc.ToString('yyyy'); $MM = $dayUtc.ToString('MM'); $dd = $dayUtc.ToString('dd')
-    $dir  = "activity/$($s.Id)/$yyyy/$MM/$dd"
-    $file = "$PREFIX" + "_$($dayUtc.ToString('yyyyMMdd')).csv"
-    $blob = "$dir/$file"
-    Write-Host "Target blob: $blob"
+    $yyyy = $dayUtc.ToString('yyyy'); 
+    $MM   = $dayUtc.ToString('MM'); 
+    $dd   = $dayUtc.ToString('dd')
+    $baseDir = "activity/$($s.Id)/$yyyy/$MM/$dd"
 
-    # Convert to CSV (sorted for readability)
-    $csvLines = $new | Sort-Object EventTimestamp | ConvertTo-Csv -NoTypeInformation
+    $createdBlobs = 0
 
-    # Append or create
-    Append-Lines-ToBlob -Context $stCtx -Container $CONTAINER -BlobName $blob -Lines $csvLines
+    foreach ($e in $new | Sort-Object EventTimestamp) {
+      $safeId = if ($e.EventDataId) { 
+        ($e.EventDataId -replace '[^a-zA-Z0-9\-]', '_') 
+      } else { 
+        [guid]::NewGuid().ToString() 
+      }
 
-    # Update index (union + sort unique)
+      $ts = $e.EventTimestamp.ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
+      $fileName = "$PREFIX" + "_${ts}_$safeId.csv"
+      $blobPath = "$baseDir/$fileName"
+
+      $csvLines = $e | ConvertTo-Csv -NoTypeInformation
+      $csvText  = $csvLines -join "`r`n"
+
+      Put-BlobText -Context $stCtx -Container $CONTAINER -BlobName $blobPath -Text $csvText
+      $createdBlobs++
+    }
+
+    Write-Host "Created $createdBlobs per-event CSV blobs for subscription $($s.Id)"
+
     $allIds = @($processed + ($new | Select-Object -Expand EventDataId)) | Sort-Object -Unique
     Put-BlobText -Context $stCtx -Container $CONTAINER -BlobName $indexPath -Text ($allIds -join "`n")
 
     $totalNew += $newCount
-    Write-Host "SUCCESS: wrote $newCount new rows"
+    Write-Host "SUCCESS: wrote $newCount new events"
   } catch {
     Write-Error ("[{0}] Outer error: {1}" -f $s.Id, ($_ | Out-String))
   }
