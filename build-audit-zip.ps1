@@ -81,33 +81,6 @@ function Put-BlobText {
   }
 }
 
-function Append-Lines-ToBlob {
-  param(
-    [object]$Context,
-    [string]$Container,
-    [string]$BlobName,
-    [string[]]$Lines
-  )
-  $tmp = New-TemporaryFile
-  try {
-    $exists = $false
-    try {
-      $dl = Get-AzStorageBlobContent -Context $Context -Container $Container `
-              -Blob $BlobName -Destination $tmp -Force -ErrorAction SilentlyContinue
-      if ($dl -and (Test-Path $tmp)) { $exists = $true }
-    } catch {}
-
-    if ($exists) {
-      $Lines | Select-Object -Skip 1 | Add-Content -Path $tmp -Encoding UTF8
-    } else {
-      $Lines | Set-Content -Path $tmp -Encoding UTF8
-    }
-
-    Set-AzStorageBlobContent -Context $Context -Container $Container -File $tmp -Blob $BlobName -Force | Out-Null
-  } finally {
-    if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
-  }
-}
 
 $RG          = $env:AUDIT_RG
 $ST_ACCOUNT  = $env:AUDIT_ST_ACCOUNT
@@ -194,25 +167,39 @@ foreach ($s in $subs) {
     $total = ($logs | Measure-Object).Count
     Write-Host "Fetched: $total events"
 
-    $indexPath = "indexes/$($s.Id)/processed_ids.txt"
-    $idxTxt    = Get-BlobText -Context $stCtx -Container $CONTAINER -BlobName $indexPath
-    $processed = @()
-    if ($idxTxt) { 
-      $processed = ($idxTxt -split "`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ } 
+    $indexPrefix = "indexes/$($s.Id)/"
+    $processed   = [System.Collections.Generic.HashSet[string]]::new()
+
+    $indexBlobs = Get-AzStorageBlob -Context $stCtx -Container $CONTAINER -Prefix $indexPrefix -ErrorAction SilentlyContinue
+    $indexCount = 0
+
+    foreach ($b in $indexBlobs) {
+      $indexCount++
+      $idxTxt = Get-BlobText -Context $stCtx -Container $CONTAINER -BlobName $b.Name
+      if (-not $idxTxt) { continue }
+
+      $idxIds = $idxTxt -split "`n"
+      foreach ($id in $idxIds) {
+        $trim = $id.Trim()
+        if ($trim) { [void]$processed.Add($trim) }
+      }
     }
-    Write-Host "Index has $(@($processed).Count) EventDataIds"
+
+    Write-Host "Found $indexCount index blobs for subscription $($s.Id)"
+    Write-Host "Total distinct EventDataIds in all indexes: $($processed.Count)"
+
 
     $new = foreach ($e in $logs) { 
-      if ($e.EventDataId -and $processed -notcontains $e.EventDataId) { $e } 
+      if ($e.EventDataId -and -not $processed.Contains($e.EventDataId)) { $e } 
     }
     $new = $new | Where-Object { $_ }
     $newCount = ($new | Measure-Object).Count
-    Write-Host "New events after dedupe: $newCount"
+    Write-Host "New events after dedupe (across all days): $newCount"
     if ($newCount -eq 0) { continue }
 
-    $yyyy = $dayUtc.ToString('yyyy'); 
-    $MM   = $dayUtc.ToString('MM'); 
-    $dd   = $dayUtc.ToString('dd')
+    $yyyy   = $dayUtc.ToString('yyyy')
+    $MM     = $dayUtc.ToString('MM')
+    $dd     = $dayUtc.ToString('dd')
     $baseDir = "activity/$($s.Id)/$yyyy/$MM/$dd"
 
     $createdBlobs = 0
@@ -237,8 +224,15 @@ foreach ($s in $subs) {
 
     Write-Host "Created $createdBlobs per-event CSV blobs for subscription $($s.Id)"
 
-    $allIds = @($processed + ($new | Select-Object -Expand EventDataId)) | Sort-Object -Unique
-    Put-BlobText -Context $stCtx -Container $CONTAINER -BlobName $indexPath -Text ($allIds -join "`n")
+    $indexPathToday = "indexes/$($s.Id)/$yyyy/$MM/$dd/processed_ids.txt"
+
+    $todayIds = $new |
+      Where-Object { $_.EventDataId } |
+      Select-Object -ExpandProperty EventDataId -Unique
+
+    Put-BlobText -Context $stCtx -Container $CONTAINER -BlobName $indexPathToday -Text ($todayIds -join "`n")
+
+    Write-Host "Wrote today's index: $indexPathToday with $(@($todayIds).Count) EventDataIds"
 
     $totalNew += $newCount
     Write-Host "SUCCESS: wrote $newCount new events"

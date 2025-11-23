@@ -165,8 +165,6 @@ No      Subscription name                       Subscription ID                 
 [1]     Alpha Test                              11111111-aaaa-bbbb-cccc-222222222222
 [2]     Another Test                            33333333-bbbb-cccc-dddd-444444444444
 [3]     Subscription X                          55555555-cccc-dddd-eeee-666666666666
-Select a subscription number: 2
-To sign in, use a web browser to open the page https://microsoft.com/devicelogin and enter the provided code.
 
 Select a tenant and subscription: 3
 
@@ -208,6 +206,8 @@ Once you confirm the login in your browser (via the device login code), both **A
 - `-ResourceGroup`: Single RG that contains **everything** (default `rg-audit-log-exec`).
 - `-ContainerName`: Storage container name (default `audit`).
 - `-ZipPath`: Path to the built functions zip (default `.\audit-timer.zip`).
+- `-DaysToArchive`: Days before blobs are archived to Cool/Archive tier (default `91`).
+- `-DaysToDelete`: Days before blobs are deleted (default `91`).
 
 ---
 
