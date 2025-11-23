@@ -206,7 +206,7 @@ function Set-AuditFailureAlert([string]$homeSubId,[string]$rg,[string]$fnName,[s
     -Enabled $true `
     -Description "Alert on failed management operations for the audit Function App"
 
-  Write-Host "✅ Activity Log Alert created/updated (cmdlet)."
+  Write-Host "✅ Activity Log Alert created."
   Write-Host "Result Id: $($result.Id)"
 }
 
@@ -251,7 +251,12 @@ function New-ClassicFunctionApp([string]$rg,[string]$name,[string]$loc,[string]$
   $app
 }
 
-function Grant-RoleAssignment([string]$objectId,[string]$scope,[string]$role){
+function Grant-RoleAssignment(
+  [string]$objectId,
+  [string]$scope,
+  [string]$role,
+  [string]$subscriptionName = $null  # optional, for nicer warnings
+){
   if ([string]::IsNullOrWhiteSpace($objectId)) {
     Write-Error "Grant-RoleAssignment: objectId is empty for scope '$scope' and role '$role'"
     return
@@ -280,9 +285,42 @@ function Grant-RoleAssignment([string]$objectId,[string]$scope,[string]$role){
     Write-Host "  -> Role '$role' granted on '$scope'"
   }
   catch {
-    Write-Error ("  -> Failed to grant role '{0}' on '{1}': {2}" -f $role, $scope, $_.Exception.Message)
+
+    $details   = $null
+    $fullText  = $_.Exception.Message
     if ($_.Exception.Response -and $_.Exception.Response.Content) {
-      Write-Host "  -> Details: $($_.Exception.Response.Content)" 
+      $details  = $_.Exception.Response.Content
+      $fullText = $fullText + " " + $details
+    }
+
+    $subIdFromScope = $null
+    if ($scope -match "/subscriptions/([^/]+)") {
+      $subIdFromScope = $Matches[1]
+    }
+
+    $label = if ($subscriptionName -and $subIdFromScope) {
+      "$subscriptionName ($subIdFromScope)"
+    } elseif ($subIdFromScope) {
+      $subIdFromScope
+    } else {
+      $scope
+    }
+
+    if ($fullText -like "*Forbidden*" -or $fullText -like "*AuthorizationFailed*") {
+      Write-Warning @"
+Skipping role assignment '$role' on subscription $label.
+Reason: The current user/service principal does not have permission to assign roles here.
+To use this audit service for this subscription, your account must have 'Owner'
+(or a role with 'Microsoft.Authorization/roleAssignments/write', e.g. 'User Access Administrator')
+on the subscription. This subscription will be skipped, the rest of the deployment continues.
+"@
+
+      return
+    }
+
+    Write-Error ("  -> Failed to grant role '{0}' on '{1}': {2}" -f $role, $scope, $_.Exception.Message)
+    if ($details) {
+      Write-Host "  -> Details: $details"
     }
     throw
   }
@@ -510,8 +548,16 @@ Grant-RoleAssignment -objectId $miPrincipalId -scope $stScope -role 'Storage Blo
 
 foreach($s in $allSubs){
   $scope = "/subscriptions/$($s.Id)"
-  Grant-RoleAssignment -objectId $miPrincipalId -scope $scope -role 'Reader'
-  Grant-RoleAssignment -objectId $miPrincipalId -scope $scope -role 'Monitoring Reader'
+
+  Grant-RoleAssignment -objectId $miPrincipalId `
+                       -scope $scope `
+                       -role 'Reader' `
+                       -subscriptionName $s.Name
+
+  Grant-RoleAssignment -objectId $miPrincipalId `
+                       -scope $scope `
+                       -role 'Monitoring Reader' `
+                       -subscriptionName $s.Name
 }
 
 $wsName = "law-audit"
