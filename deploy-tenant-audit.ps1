@@ -48,7 +48,7 @@ function Get-ShortHash([string]$s){
 }
 
 function Get-StableStorageName([string]$subId){
-  $raw = ('stauditlogexec' + (Get-ShortHash $subId)).ToLower()
+  $raw = ('stazauditlogexec' + (Get-ShortHash $subId)).ToLower()
   if($raw.Length -gt 24){
     $raw = $raw.Substring(0,24)
   }
@@ -78,18 +78,41 @@ function Get-StorageAccount([string]$rg,[string]$loc,[string]$name,[bool]$AllowS
   $st = Get-AzStorageAccount -ResourceGroupName $rg -Name $name -ErrorAction SilentlyContinue
   if($st){ return $st }
 
-  New-AzStorageAccount `
-    -ResourceGroupName $rg -Name $name -Location $loc `
-    -SkuName 'Standard_GRS' -Kind StorageV2 -EnableHierarchicalNamespace $true `
-    -AllowBlobPublicAccess $false -AllowSharedKeyAccess $AllowSharedKey -MinimumTlsVersion TLS1_2 | Out-Null
+New-AzStorageAccount `
+  -ResourceGroupName $rg `
+  -Name $name `
+  -Location $loc `
+  -SkuName 'Standard_GRS' `
+  -Kind StorageV2 `
+  -EnableHierarchicalNamespace $true `
+  -AllowBlobPublicAccess $false `
+  -AllowSharedKeyAccess $AllowSharedKey `
+  -MinimumTlsVersion TLS1_2 | Out-Null
 
   Get-AzStorageAccount -ResourceGroupName $rg -Name $name
 }
 
 function Set-ContainerAAD($stName,[string]$container){
-  $ctx = New-AzStorageContext -StorageAccountName $stName -UseConnectedAccount
-  if(-not (Get-AzStorageContainer -Context $ctx -Name $container -ErrorAction SilentlyContinue)){
-    New-AzStorageContainer -Name $container -Context $ctx -Permission Off | Out-Null
+
+  $subId = (Get-AzContext).Subscription.Id
+
+  $path = "/subscriptions/$subId/resourceGroups/$ResourceGroup/providers/Microsoft.Storage/storageAccounts/$stName/blobServices/default/containers/$container?api-version=2023-05-01"
+
+  $payload = @{
+    properties = @{
+      publicAccess = "None"
+    }
+  } | ConvertTo-Json -Depth 4
+
+  Write-Host "☁️  Ensuring blob container '$container' exists in storage account '$stName' via ARM..."
+
+  try {
+    Invoke-AzRestMethod -Method PUT -Path $path -Payload $payload | Out-Null
+    Write-Host "   -> Container '$container' is present (created or already existed)."
+  }
+  catch {
+    Write-Error "Failed to create/ensure container '$container' in storage account '$stName'. Error: $($_.Exception.Message)"
+    throw
   }
 }
 
@@ -171,8 +194,8 @@ function Set-ActionGroup([string]$homeSubId,[string]$rg,[string]$email){
 Import-Module Az.Monitor -Force
 
 function Set-AuditFailureAlert([string]$homeSubId,[string]$rg,[string]$fnName,[string]$actionGroupId){
-  $alertName = 'audit-fn-failures'
-  $scope     = "/subscriptions/$homeSubId"
+  $alertName    = 'audit-fn-failures'
+  $scope        = "/subscriptions/$homeSubId"
   $fnResourceId = "/subscriptions/$homeSubId/resourceGroups/$rg/providers/Microsoft.Web/sites/$fnName"
 
   Write-Host "---- Creating Activity Log Alert (cmdlet) ----"
@@ -264,6 +287,7 @@ function Grant-RoleAssignment(
 
   Write-Host "Grant-RoleAssignment: scope='$scope', role='$role', objectId='$objectId'"
 
+  # --- Check if role already exists ---
   $exists = Get-AzRoleAssignment `
     -ObjectId $objectId `
     -Scope $scope `
@@ -276,6 +300,7 @@ function Grant-RoleAssignment(
   }
 
   try {
+    # --- Create role assignment ---
     New-AzRoleAssignment `
       -ObjectId $objectId `
       -Scope $scope `
@@ -314,7 +339,6 @@ To use this audit service for this subscription, your account must have 'Owner'
 (or a role with 'Microsoft.Authorization/roleAssignments/write', e.g. 'User Access Administrator')
 on the subscription. This subscription will be skipped, the rest of the deployment continues.
 "@
-
       return
     }
 
@@ -399,16 +423,23 @@ function Get-HostKeys([string]$sub,[string]$rg,[string]$fn){
   if($keys){ return $keys }
 
   # Create a master key if missing
-  $newKey = -join ((48..57+65..90+97..122) | Get-Random -Count 64 | ForEach-Object { [char]$_ })
+  $newKey = -join ((48..57 + 65..90 + 97..122) | Get-Random -Count 64 | ForEach-Object { [char]$_ })
   $setUrl = "https://management.azure.com/subscriptions/$sub/resourceGroups/$rg/providers/Microsoft.Web/sites/$fn/host/default/setmasterkey?api-version=$api"
 
+  $bodyObject = @{
+    properties = @{
+      masterKey = $newKey
+    }
+  }
+  $bodyJson = $bodyObject | ConvertTo-Json -Depth 3
+
   try {
-    az rest --method post --only-show-errors --url $setUrl --body ("{`"properties`":{`"masterKey`":`"$newKey`"}}") | Out-Null
+    az rest --method post --only-show-errors --url $setUrl --body $bodyJson --headers "Content-Type=application/json" | Out-Null
   } catch { }
 
   Start-Sleep -Seconds 5
   $keys = & $tryList
-  if($keys){ return $keys }
+  if ($keys) { return $keys }
 
   Write-Warning "Host keys still unavailable after init attempts."
   return $null
@@ -424,7 +455,7 @@ function Set-LogAnalyticsWorkspace([string]$rg,[string]$loc,[string]$name){
 
 function Set-AppInsights([string]$rg,[string]$loc,[string]$name,[string]$workspaceResourceId){
   $ai = Get-AzApplicationInsights -ResourceGroupName $rg -Name $name -ErrorAction SilentlyContinue
-  if(-not $ai){
+  if (-not $ai) {
     $ai = New-AzApplicationInsights `
       -ResourceGroupName $rg `
       -Name $name `
@@ -544,20 +575,26 @@ Update-AzFunctionAppSetting -ResourceGroupName $ResourceGroup -Name $fnName -App
 } -Force | Out-Null
 
 $stScope = "/subscriptions/$HomeSubId/resourceGroups/$ResourceGroup/providers/Microsoft.Storage/storageAccounts/$($st.StorageAccountName)"
-Grant-RoleAssignment -objectId $miPrincipalId -scope $stScope -role 'Storage Blob Data Contributor'
+
+Grant-RoleAssignment `
+  -ObjectId $miPrincipalId `
+  -Scope $stScope `
+  -Role 'Storage Blob Data Contributor'
 
 foreach($s in $allSubs){
   $scope = "/subscriptions/$($s.Id)"
 
-  Grant-RoleAssignment -objectId $miPrincipalId `
-                       -scope $scope `
-                       -role 'Reader' `
-                       -subscriptionName $s.Name
+  Grant-RoleAssignment `
+    -ObjectId $miPrincipalId `
+    -Scope $scope `
+    -Role 'Reader' `
+    -SubscriptionName $s.Name
 
-  Grant-RoleAssignment -objectId $miPrincipalId `
-                       -scope $scope `
-                       -role 'Monitoring Reader' `
-                       -subscriptionName $s.Name
+  Grant-RoleAssignment `
+    -ObjectId $miPrincipalId `
+    -Scope $scope `
+    -Role 'Monitoring Reader' `
+    -SubscriptionName $s.Name
 }
 
 $wsName = "law-audit"

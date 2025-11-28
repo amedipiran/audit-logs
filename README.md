@@ -1,303 +1,477 @@
-# Azure Audit Log Archiver — Deployment Guide
+# Azure Audit Log Archiver
 
-This README explains **exactly** how to package and deploy the *Azure Audit Log Archiver* using the provided PowerShell script. It covers prerequisites, required permissions, module requirements, REST APIs used, how the script behaves (single login + single subscription), and how to validate and troubleshoot the deployment.
+This solution deploys an Azure Functions timer that periodically exports **Azure Activity Logs** (subscription-level audit logs) for all enabled subscriptions in a tenant into a **central ADLS Gen2 storage account**, with lifecycle rules for archiving and deletion.
+
+The README is based on the current scripts:
+
+- `build-audit-zip.ps1` – builds the function app package (`audit-timer.zip`).
+- `deploy-tenant-audit.ps1` – deploys storage, Function App, monitoring, roles, and zip package.
 
 ---
 
 ## What the solution does
 
-In **one selected subscription** (you pick it interactively once after logging into the tenant), the script will:
+In **one chosen subscription** (interactive selector), the deployment script:
 
-- Ensure a single **Resource Group** (default: `rg-audit-log-exec`).
-- Ensure an **ADLS Gen2 Storage Account** (stable name per-subscription, e.g. `stauditlogexec<hash>`) and a **container** (default: `audit`).
-- Apply a **Lifecycle Management policy**: archive blobs after 91 days under the given prefix.
-- Create an **Action Group** (`ag-audit-email`) with your notification email.
-- Create a **Function App** (Flex Consumption if possible; fallback to Linux Consumption) named `fn-audit-log-exec<hash>`.
-- Wire **Managed Identity** to the Function App and grant **Storage Blob Data Contributor** on the storage account.
-- Create a **Log Analytics Workspace** (`law-audit`) and an **Application Insights** component (`appi-<functionName>`) linked to that workspace.
-- Enable **Subscription Activity Logs → Storage** diagnostics across **all Enabled subscriptions** in the tenant (best-effort; skips where you lack permission).
-- **Zip-deploy your functions package** (`audit-timer.zip`) to the Function App, **sync triggers**, restart, and verify **host keys** exist.
+- Creates or reuses a **resource group** (default: `rg-az-audit-log-exec`).
+- Creates or reuses an **ADLS Gen2 storage account** with a deterministic name per subscription  
+  `stazauditlogexec<8-char-hash>`.
+- Ensures a **container** (default: `audit`) exists via ARM and sets `publicAccess = None`.
+- Applies a **lifecycle policy** on the storage account for the given container prefix:
+  - Archive blobs after `DaysToArchive` (default `91` days).
+  - Delete blobs after `DaysToArchive + DaysToDelete` (default `182` days total).
+- Creates or reuses an **Action Group** (`ag-audit-email`) for email alerts.
+- Creates a **Function App** (Flex Consumption first, fallback to Linux Consumption):
+  - Name: `fn-az-audit-log-exec-<8-char-hash>`
+  - System-assigned managed identity enabled.
+  - App settings wired for storage, tenant, and time zone.
+- Creates or reuses:
+  - **Log Analytics Workspace**: `law-audit`
+  - **Application Insights**: `appi-fn-az-audit-log-exec-<hash>` (workspace-based).
+- Grants the Function App managed identity:
+  - `Storage Blob Data Contributor` on the storage account.
+  - `Reader` and `Monitoring Reader` on **each enabled subscription** in the tenant.
+- Deploys the timer function code from `audit-timer.zip` using **Kudu Zip Deploy**.
+- Syncs function triggers, restarts the Function App, and ensures **host keys** are initialized.
+- Adds **CORS** for the Azure portal so the Functions UI can call management endpoints.
+- Creates an **Activity Log Alert** that notifies on failed administrative operations for the Function App.
 
-> **Everything is deployed into a single resource group** that you choose via the `-ResourceGroup` parameter (default `rg-audit-log-exec`).
+The **timer function** (`AuditTimer`) then runs every six hours and:
+
+1. Authenticates with **Managed Identity**.
+2. For each enabled subscription:
+   - Reads existing **index blobs** (`indexes/<subId>/.../processed_ids.txt`) to know which Activity Log `EventDataId`s were already stored.
+   - Queries **Activity Logs** for the current UTC day up to "now".
+   - Deduplicates events by `EventDataId` across all previous indexes.
+   - Writes **per-event CSV blobs** under:
+     `activity/<subId>/YYYY/MM/DD/AzActivity_<timestamp>_<EventDataId>.csv`
+   - Writes/updates `processed_ids.txt` for the day with all `EventDataId`s processed.
 
 ---
 
 ## Repository layout (expected)
 
-```
+```text
 /
 ├─ build-audit-zip.ps1        # Builds the function app package (audit-timer.zip)
-├─ deploy-tenant-audit.ps1    # The deployment script described in this README
-├─ src/                       # Your function code (ps1/run.ps1/function.json etc.)
-└─ audit-timer.zip            # Output produced by build-audit-zip.ps1
+├─ deploy-tenant-audit.ps1    # Deployment script for the tenant + central subscription
+└─ audit-timer.zip            # Function app package built by build-audit-zip.ps1
 ```
 
-> If you keep a different structure, ensure `-ZipPath` in the deploy script points to the right file.
+> If you change the layout, update `-ZipPath` in `deploy-tenant-audit.ps1`.
 
 ---
 
 ## Prerequisites
 
-### 1) Permissions (RBAC)
+### Azure / Identity
 
-You need **Owner** on the subscriptions to create and configure the resources below. To enable diagnostics on *other* subscriptions in the tenant, you’ll also need at least **Monitoring Contributor** or equivalent on those subscriptions. Minimum effective roles per resource:
+- An **Azure AD (Entra ID) tenant** GUID (used as `-TenantId`).
+- At least one **Enabled** subscription in that tenant.
+- Your user or service principal must have **sufficient RBAC** (see below).
 
-- **Resource Group / Storage / Function App / LAW / App Insights**: *Owner*.
-- **Role assignment to Function App’s Managed Identity** (Storage Blob Data Contributor on the Storage Account): *User Access Administrator* or *Owner* on the Storage Account scope.
-- **Diagnostic settings at subscription scope**: *Monitoring Contributor* or *Owner* on each target subscription.
+### Roles and permissions (RBAC)
 
+For the **deployment** subscription (the one you pick interactively):
 
-### 2) Tools
+- On the **subscription scope** (or equivalent):
+  - `Owner` **or** combination of roles that allow:
+    - Creating resource groups, storage, function apps, LAW, Application Insights.
+    - Registering resource providers.
+- On the **storage account** scope:
+  - To let the script grant the Function App identity **Storage Blob Data Contributor**:
+    - `Owner` or `User Access Administrator` on the storage account or above.
 
-- **PowerShell 7+** (`pwsh`): required.
-- **Azure PowerShell (Az) modules**: the script will auto-install missing modules under CurrentUser scope.
-- **Azure CLI** (`az`): required for some calls (CORS, function trigger sync, and host key operations).
+For **reading audit blobs** later:
 
-### 3) Network/Endpoints you must be able to reach
+- On the **storage account** scope:
+  - `Storage Blob Data Reader` for users who should browse the `audit` container.
 
-- `management.azure.com` (ARM)
-- `*.azurewebsites.net` (Kudu zipdeploy + function admin endpoints)
-- `login.microsoftonline.com` / `device.login.microsoftonline.com` (Auth)
+> In many organizations, assigning data-plane roles (like `Storage Blob Data Reader`) requires a **Global Administrator** in Entra ID to grant the role. Even if you are an Owner on the subscription, you might not be allowed to assign this role yourself.
 
-### 4) Resource Providers registered in the subscription
+### Tools / runtimes
 
-The script ensures these are registered:
+On the machine where you run the scripts:
+
+- **PowerShell 7+** (`pwsh`)
+- **Azure PowerShell** Az modules (the script will auto-install what’s missing under `CurrentUser`):
+  - `Az.Accounts`
+  - `Az.Resources`
+  - `Az.Storage`
+  - `Az.Monitor`
+  - `Az.Functions`
+  - `Az.Websites`
+  - `Az.ApplicationInsights`
+  - `Az.OperationalInsights`
+- **Azure CLI** (`az`)
+  - Used for:
+    - `az login --use-device-code`
+    - `az account set ...`
+    - `az rest` for function trigger sync and host keys
+    - `az functionapp cors add`
+
+### Network / endpoints
+
+The machine and Function App must be able to reach:
+
+- `https://management.azure.com`
+- `https://login.microsoftonline.com` and `https://device.login.microsoftonline.com`
+- `https://{your-site}.scm.azurewebsites.net` (Kudu)
+- `https://{your-site}.azurewebsites.net`
+
+### Resource Providers (auto-registered)
+
+The deployment script registers these if needed:
+
 - `Microsoft.Web`
 - `Microsoft.Storage`
 - `Microsoft.Insights`
 - `Microsoft.OperationalInsights`
 
+---
 
-### 5) Viewing logs requires a Global Administrator role
+## REST / ARM APIs used (with versions)
 
-To view the archived audit logs inside the storage account container, a user must be assigned “Storage Blob Data Reader” on that storage account.
+These are the key REST APIs used by `deploy-tenant-audit.ps1` and called via `Invoke-AzRestMethod` or `az rest`:
 
-**⚠️ Important:**
-In Azure AD (Entra ID), only a Global Administrator is allowed to assign Azure RBAC roles that grant data-plane access on Storage Accounts (e.g., Storage Blob Data Reader).
+### Storage container (private, ADLS Gen2)
 
-Even if you are Owner on the subscription or the storage account, you cannot grant yourself (or others) this role unless you also have the Global Administrator directory role.
+```http
+PUT /subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}
+    /providers/Microsoft.Storage/storageAccounts/{storageAccountName}
+    /blobServices/default/containers/{containerName}?api-version=2023-05-01
+```
 
-This means:
-+ The Global Admin must go to
-**Storage Account** → **Access Control (IAM)** → **Add Role Assignment**
-+ Choose **Storage Blob Data Reader**
-+	Assign it to the user needing log access
-+	After this, the user can browse the logs in **Containers** → **audit**
+Used in `Set-ContainerAAD` to ensure the container exists and set:
 
-Without this, the user will see “You don’t have permission” even if they are an Owner on the subscription.
+```json
+{
+  "properties": {
+    "publicAccess": "None"
+  }
+}
+```
+
+### Subscription diagnostic settings → storage
+
+```http
+PUT /subscriptions/{subscriptionId}
+    /providers/microsoft.insights/diagnosticSettings/{name}
+    ?api-version=2021-05-01-preview
+```
+
+Used in `Enable-SubscriptionActivityLogsToStorage` to send **Activity Logs** to the central storage account.
+
+### Action Group
+
+```http
+PUT /subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}
+    /providers/microsoft.insights/actionGroups/{actionGroupName}
+    ?api-version=2021-09-01
+```
+
+Used in `Set-ActionGroup` to create `ag-audit-email` with one email receiver.
+
+### Function App (Flex Consumption)
+
+```http
+PUT   /subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}
+      /providers/Microsoft.Web/sites/{siteName}?api-version=2023-12-01
+
+PATCH /subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}
+      /providers/Microsoft.Web/sites/{siteName}?api-version=2023-12-01
+```
+
+Used in `New-FlexFunctionApp` to:
+- Create a **Linux function app** on **Flex Consumption** (`sku: FC1`).
+- Assign a **system-assigned managed identity**.
+
+### Function trigger sync
+
+```http
+POST /subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}
+     /providers/Microsoft.Web/sites/{siteName}/syncfunctiontriggers
+     ?api-version=2024-11-01
+```
+
+Called in `Sync-FunctionTriggers` using `az rest` after zip deployment.
+
+### Function host keys (master key)
+
+```http
+POST /subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}
+     /providers/Microsoft.Web/sites/{siteName}/host/default/listkeys
+     ?api-version=2024-11-01
+
+POST /subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}
+     /providers/Microsoft.Web/sites/{siteName}/host/default/setmasterkey
+     ?api-version=2024-11-01
+```
+
+Used in `Get-HostKeys`:
+
+- First tries `listkeys`.  
+- If no keys are returned, it:
+  - Syncs triggers.
+  - Restarts the app.
+  - Optionally calls `setmasterkey` with a newly generated key.
+  - Tries `listkeys` again.
+
+### Kudu Zip Deploy (not ARM)
+
+```http
+POST https://{siteName}.scm.azurewebsites.net/api/zipdeploy?isAsync=true
+```
+
+Used in `ZipDeploy` with **Basic Auth** (publishing profile) to upload `audit-timer.zip`.
 
 ---
 
-## REST/ARM APIs used by the script
+## How the timer function works
 
-These are invoked via `Invoke-AzRestMethod` or `az rest`:
+The function package is built by `build-audit-zip.ps1` and contains:
 
-- **Subscription Diagnostic Settings → Storage**
-  - `PUT /subscriptions/{subId}/providers/microsoft.insights/diagnosticSettings/{name}?api-version=2021-05-01-preview`
-- **Action Group**
-  - `PUT /subscriptions/{subId}/resourceGroups/{rg}/providers/microsoft.insights/actionGroups/{name}?api-version=2021-09-01`
-- **Function App (Flex Consumption)**
-  - `PUT /subscriptions/{subId}/resourceGroups/{rg}/providers/Microsoft.Web/sites/{name}?api-version=2023-12-01`
-  - `PATCH …/sites/{name}?api-version=2023-12-01` (assign system identity)
-- **Function triggers sync**
-  - `POST …/sites/{name}/syncfunctiontriggers?api-version=2024-11-01`
-- **Function host keys (portal readiness / master key)**
-  - `POST …/sites/{name}/host/default/listkeys?api-version=2024-11-01`
-  - `POST …/sites/{name}/host/default/setmasterkey?api-version=2024-11-01`
-- **Kudu Zip Deploy** (not ARM; per-site SCM endpoint)
-  - `POST https://{site}.scm.azurewebsites.net/api/zipdeploy?isAsync=true`
+- `host.json` – Functions host configuration.
+- `requirements.psd1` – Az module dependencies for the Functions runtime.
+- `AuditTimer/function.json` – timer trigger binding.
+- `AuditTimer/run.ps1` – main logic.
 
-> **Log Analytics Workspace** and **Application Insights** are primarily created via Az cmdlets. App Insights is workspace-based (`-WorkspaceResourceId`). Newer Az versions will change output types for `Get/New-AzApplicationInsights` (the script remains compatible).
+### host.json
 
+```json
+{
+  "version": "2.0",
+  "managedDependency": { "enabled": true },
+  "extensionBundle": {
+    "id": "Microsoft.Azure.Functions.ExtensionBundle",
+    "version": "[4.*, 5.0.0)"
+  }
+}
+```
 
-### 5)  
+### requirements.psd1
+
+```powershell
+@{
+  "Az.Accounts"  = "2.*"
+  "Az.Resources" = "6.*"
+  "Az.Monitor"   = "5.*"
+  "Az.Storage"   = "6.*"
+}
+```
+
+The Functions runtime will manage these module versions at runtime.
+
+### Timer trigger (function.json)
+
+```json
+{
+  "bindings": [
+    { "name": "Timer", "type": "timerTrigger", "direction": "in", "schedule": "0 0 */6 * * *" }
+  ],
+  "scriptFile": "run.ps1"
+}
+```
+
+Default **cron**: every 6 hours.
+
+### Environment variables used by the function
+
+Set by the deployment script on the Function App:
+
+- `AUDIT_RG` – Resource group name hosting the storage account.
+- `AUDIT_ST_ACCOUNT` – Storage account name.
+- `AUDIT_CONTAINER` – Container where data and indexes are stored.
+- `AUDIT_PREFIX` – File prefix for event CSV files (default `AzActivity`).
+- `AUDIT_HOME_SUB` – Home subscription where infra lives.
+- `AUDIT_TENANT_ID` – Tenant ID.
+- `WEBSITE_TIME_ZONE` – `W. Europe Standard Time` (set both in app config and Flex function app settings).
+
+### High-level algorithm (run.ps1)
+
+1. Validate required env vars (`AUDIT_RG`, `AUDIT_ST_ACCOUNT`, `AUDIT_CONTAINER`).
+2. Import Az modules (`Accounts`, `Resources`, `Monitor`, `Storage`).
+3. `Connect-AzAccount -Identity` (managed identity of the Function App).
+4. If `AUDIT_HOME_SUB` is set, call `Select-AzSubscription` to stabilize context.
+5. Get the storage account and a `New-AzStorageContext -UseConnectedAccount` context.
+6. Ensure the container exists:
+   - If `New-AzStorageContainer` throws `ResourceAlreadyExistException`, the function logs that it already exists and continues.
+7. Compute the query window:
+   - `from = current-day UTC (00:00)`
+   - `to   = now UTC`
+8. Get all enabled subscriptions:
+   - `Get-AzSubscription | Where-Object { $_.State -eq 'Enabled' }`
+   - If this fails, fallback to the current context subscription.
+9. For each subscription:
+   - `Select-AzSubscription` to that subscription.
+   - Call `Get-AzActivityLog -StartTime $from -EndTime $to` selecting relevant fields.
+   - Load existing index blobs under `indexes/<subId>/...` and build a `HashSet<string>` of known `EventDataId`s.
+   - Filter logs to only those where `EventDataId` is not in the set.
+   - For each new event:
+     - Build a safe file name based on timestamp and sanitized `EventDataId`.
+     - Convert event to CSV (`ConvertTo-Csv`) and upload via `Put-BlobText` to `activity/<subId>/YYYY/MM/DD/...`.
+   - Write `processed_ids.txt` for that day with all `EventDataId`s processed.
+10. Summarize:
+    - Log number of new events across all subscriptions.
+
 ---
 
-## Build first: package your functions
+## Deployment step by step
 
-Before deploying, **build the functions package**. Example `build-audit-zip.ps1` pattern:
+### 1. Build the function package
+
+From the repo root (where `build-audit-zip.ps1` lives):
 
 ```powershell
 pwsh ./build-audit-zip.ps1
-# This should create: ./audit-timer.zip
 ```
 
-If you don’t have a build script, simply zip your function app root into `audit-timer.zip` and place it next to `deploy-tenant-audit.ps1`, or change `-ZipPath` accordingly.
+This script:
 
----
+- Creates a temporary folder.
+- Writes `host.json`, `requirements.psd1`, and the `AuditTimer` function files.
+- Zips everything into `audit-timer.zip` in the current directory.
+- Deletes the temp folder.
 
-## Deploy
+After this step you should have:
 
-Run the deployment script in PowerShell 7+:
+```text
+./audit-timer.zip
+```
+
+### 2. Deploy infrastructure + function
+
+From the same directory:
 
 ```powershell
 pwsh ./deploy-tenant-audit.ps1 `
   -TenantId "<YOUR_TENANT_GUID>" `
   -NotificationEmail "you@example.com" `
   -Location "swedencentral" `
-  -ResourceGroup "rg-audit-log-exec" `
+  -ResourceGroup "rg-az-audit-log-exec" `
   -ContainerName "audit" `
   -ZipPath ".\audit-timer.zip" `
   -DaysToArchive 91 `
   -DaysToDelete 91
 ```
 
-### ⚠️ Important — Subscription Selection During Login
+What happens:
 
-When you run the script, you will be prompted to log in and choose a subscription interactively:
+1. **Modules** are initialized (install/import Az modules if needed).
+2. Any previous Az context is cleared and `Connect-AzAccount -Tenant <TenantId>` is executed.
+3. All **Enabled** subscriptions in the tenant are listed and you see a prompt:
 
+   ```text
+   Available subscriptions in tenant <TenantId>
+     1. Sub A     <subId1>
+     2. Sub B     <subId2>
+     3. Sub C     <subId3>
+
+   Select a subscription number:
+   ```
+
+4. You choose one number. That subscription becomes the **deployment subscription** (`$HomeSubId`).
+5. Az context is set to that subscription and tenant.
+6. Azure CLI is aligned to the same tenant + subscription:
+
+   ```powershell
+   az account clear
+   az login --tenant <TenantId> --use-device-code
+   az account set --subscription <HomeSubId>
+   ```
+
+7. Resource providers are registered if needed.
+8. Resource group, storage account, container (via ARM), lifecycle rule, Action Group, Function App, Log Analytics workspace, App Insights, roles, CORS, alert, and app settings are created or updated.
+9. `audit-timer.zip` is deployed via Kudu Zip Deploy.
+10. Function triggers are synced, the Function App is restarted, and host keys are verified.
+
+At the end you should see something like:
+
+```text
+✅ Deployment complete
+Function App:   fn-az-audit-log-exec-xxxxxxxx  (RG: rg-az-audit-log-exec)
+Storage:        stazauditlogexecxxxxxxxx       (RG: rg-az-audit-log-exec)  Container: audit
+App Insights:   appi-fn-az-audit-log-exec-xxxxxxxx  (RG: rg-az-audit-log-exec)
+Workspace:      law-audit                      (RG: rg-az-audit-log-exec)
+MI ObjectId:    <guid>
 ```
-Id                    : user@example.com
-Type                  : User
-Tenants               : {11111111-2222-3333-4444-555555555555}
-Credential            :
-ExtendedProperties    : {[Tenants, 11111111-2222-3333-4444-555555555555],
-                        [Subscriptions, aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee,
-                         ffffffff-1111-2222-3333-444444444444]}
 
-Please select the account you want to login with.
+### 3. Validate in the Azure portal
 
-Retrieving subscriptions for the selection...
-[Tenant and subscription selection]
+1. **Resource group**
+   - Open `rg-az-audit-log-exec` (or your custom RG name).
+   - Confirm:
+     - Storage account
+     - Function App
+     - Log Analytics workspace
+     - Application Insights
+     - (Plan resource if using Consumption)
+2. **Storage account**
+   - Go to **Data storage → Containers**.
+   - Confirm container `audit` exists.
+   - Under **Data management → Lifecycle management**, check the rule with name similar to `archive-91-delete-182`.
+3. **Function App**
+   - Under **Configuration → Application settings**, verify the `AUDIT_*` keys and `APPLICATIONINSIGHTS_CONNECTION_STRING`.
+   - Under **Functions**, verify that `AuditTimer` exists.
+4. **Action Group**
+   - Under **Monitor → Alerts → Action groups**, verify `ag-audit-email`.
+5. **Activity Log Alert**
+   - Under **Monitor → Alerts → Alert rules**, verify an alert named `audit-fn-failures`.
 
-No      Subscription name                       Subscription ID                             Tenant name
-----    ------------------------------------    ----------------------------------------    --------------------------
-[1]     Alpha Test                              11111111-aaaa-bbbb-cccc-222222222222
-[2]     Another Test                            33333333-bbbb-cccc-dddd-444444444444
-[3]     Subscription X                          55555555-cccc-dddd-eeee-666666666666
+### 4. Verify logs are written
 
-Select a tenant and subscription: 3
-
-Available subscriptions in tenant cc5cd634-cdbc-4fa2-aec1-4ebaa651d0d8
-  1. Alpha Test                                   11111111-aaaa-bbbb-cccc-222222222222
-  2. Another test                                 33333333-bbbb-cccc-dddd-444444444444
-  3. Subscription X                            55555555-cccc-dddd-eeee-666666666666
-
-Select a subscription number: 3
-To sign in, use a web browser to open the page https://microsoft.com/devicelogin and enter the code G9QZ7UVAW to authenticate.
-```
-
-> **It is critical that you choose the same subscription that belongs to the account you just logged in with (`Connect-AzAccount`).**
->
-> This ensures that the deployment context between PowerShell and the Azure CLI remains consistent.
->  
-> Selecting a subscription from another tenant or one where your account is only a guest can cause failures in role assignment, storage setup, or diagnostic configuration.
-
-Once you confirm the login in your browser (via the device login code), both **Azure PowerShell** and **Azure CLI** will automatically use that same subscription for all subsequent operations.
-
----
-
-### Interactive login + single subscription
-
-- The script **logs out/clears context**, then **logs in once** to the tenant you specify.
-- You will see a numbered list of **Enabled subscriptions** in that tenant.
-- **Pick one**; that subscription becomes the **deployment subscription** for **all** resources.
-- The script also pins **Azure CLI** to the same subscription (for subsequent `az` calls).
-
-> Everything is created in the chosen subscription and resource group. Diagnostic settings to other subscriptions are configured best-effort.
-
----
-
-## Parameters
-
-- `-TenantId` (**required**): Tenant GUID to log into.
-- `-NotificationEmail` (**required**): Email used by the Action Group.
-- `-Location`: Azure region for all resources (default `swedencentral`).
-- `-ResourceGroup`: Single RG that contains **everything** (default `rg-audit-log-exec`).
-- `-ContainerName`: Storage container name (default `audit`).
-- `-ZipPath`: Path to the built functions zip (default `.\audit-timer.zip`).
-- `-DaysToArchive`: Days before blobs are archived to Cool/Archive tier (default `91`).
-- `-DaysToDelete`: Days before blobs are deleted (default `91`).
-
----
-
-## What gets created (names are stable per subscription)
-
-- **Resource Group**: `rg-audit-log-exec` (or your override).
-- **Storage Account**: `stauditlogexec<hash>` (ADLS Gen2, HNS enabled)
-  - **Container**: `audit`
-  - **Lifecycle Policy**: Archive after 91 days (prefix = container name)
-- **Action Group**: `ag-audit-email` (global)
-- **Function App**: `fn-audit-log-exec<hash>`
-  - Flex Consumption by default; fallback to Linux Consumption if Flex fails.
-  - Managed identity enabled; granted *Storage Blob Data Contributor* on the storage account.
-  - App settings include `APPLICATIONINSIGHTS_CONNECTION_STRING` when available.
-- **Log Analytics Workspace**: `law-audit`
-- **Application Insights**: `appi-fn-audit-log-exec<hash>` (workspace-based)
-- **Subscription Diagnostics → Storage**: on **all Enabled subscriptions** in tenant (best effort).
-
----
-
-## Validate the deployment
-
-1. **Resource Group**: open the RG in the portal; you should see 5+ resources (Storage, Function App, App Service plan (if Consumption), Action Group (global), LAW, App Insights).
-2. **Storage**: in the `audit` container, verify the container exists; lifecycle management rule is visible under **Data Management → Lifecycle management**.
-3. **Diagnostic settings**: for each subscription, open **Monitor → Activity log → Export to a storage account**; ensure there’s a diagnostic setting named `ds-activity-to-storage` pointing to your storage account.
-4. **Function App**:
-   - **Configuration → Application settings**: confirm your settings (e.g., `APPLICATIONINSIGHTS_CONNECTION_STRING`, `AUDIT_*` keys).
-   - **Functions**: confirm your functions are listed after sync (the script runs sync + restart).
-5. **Application Insights**: open `appi-…` and check **Live Metrics** or **Logs** after some time for function telemetry.
-6. **Action Group**: verify it exists (`ag-audit-email`) and test a notification if you like.
+- Wait for the timer to run (or trigger it manually from the Functions portal).  
+- Then in the storage account:
+  - Open container `audit`.
+  - Navigate into `activity/<subId>/YYYY/MM/DD/` and look for `AzActivity_*.csv` files.
+  - Under `indexes/<subId>/YYYY/MM/DD/`, check `processed_ids.txt`.
 
 ---
 
 ## Troubleshooting
 
-- **`Zip not found`** — run `build-audit-zip.ps1` (or create the zip manually) and confirm `-ZipPath`.
-- **Stuck at subscription picker** — ensure PowerShell 7, stable internet, and that you are consenting to device login if prompted.
-- **`ResourceNotFound` for LAW** — transient; the script uses `New-AzOperationalInsightsWorkspace`, but if you see races, re-run (LAW creation is idempotent). If you want strict polling, add a provisioning-state poll after creation.
-- **Role assignment warnings** — your account may lack `User Access Administrator` on the storage account scope. Assign **Storage Blob Data Contributor** to the Function App’s **managed identity** manually.
-- **Host keys unavailable warning** — the Function App may still be warming up. Keys typically appear shortly; the app will still run.
-- **Diagnostic settings failures on some subs** — you might lack rights in those subscriptions. Configure manually later from **Monitor → Activity log**.
-- **Application Insights “breaking change” warnings** — These are **informational** about future Az changes. The script uses workspace-based Insights already and remains compatible.
+- **`Zip not found: .\audit-timer.zip`**
+  - Run `pwsh ./build-audit-zip.ps1` first.
+  - Or adjust `-ZipPath` in the deploy command.
+- **Role assignment warnings (`Forbidden` or `AuthorizationFailed`)**
+  - Your identity may lack permission to assign roles.
+  - A user with `Owner` or `User Access Administrator` must assign:
+    - `Storage Blob Data Contributor` to the Function App managed identity.
+    - `Storage Blob Data Reader` to users who should read the blobs.
+- **Diagnostic settings failing on some subscriptions**
+  - You might lack rights in those subscriptions.
+  - Configure them manually later if needed.
+- **Host keys warning**
+  - If `Get-HostKeys` cannot retrieve keys immediately, the script logs a warning.
+  - The Function App usually becomes ready shortly after; this does not block execution.
 
 ---
 
 ## Clean-up
 
-To remove everything created by the script in the chosen subscription:
+To remove all resources created in the deployment subscription:
 
-1. **Delete diagnostic settings** at subscription scope (optional): remove the `ds-activity-to-storage` diagnostic setting if you wish.
-2. **Delete the resource group**:
-   ```powershell
-   Remove-AzResourceGroup -Name "<YourRG>" -Force -AsJob
-   ```
-
----
-
-## Notes on idempotency
-
-- The script **ensures** (create-if-missing) for RG, storage, container, diagnostic settings, LAW, App Insights, Function App, Action Group, role assignments, and app settings.
-- Re-running the script is safe; it updates or skips existing resources.
-
----
-
-## Security
-
-- Storage public access is **disabled**.
-- Function App uses **system-assigned managed identity**.
-- Function secrets are stored as **files** by default (set by app settings).
-
----
-
-## Versioning & Compatibility
-
-- PowerShell 7.5+ recommended.
-- Azure PowerShell (Az) regularly updates. The script remains compatible with upcoming `Get/New-AzApplicationInsights` output-type changes.
-- ARM API versions listed above are current as of this doc and may change; adjust if Azure introduces newer stable versions in your environment.
-
----
-
-## Quick Start (TL;DR)
+1. (Optional) Remove subscription diagnostic settings pointing to this storage account.
+2. Delete the resource group:
 
 ```powershell
-# 1) Build functions
-pwsh ./build-audit-zip.ps1   # produces ./audit-timer.zip
+Remove-AzResourceGroup -Name "rg-az-audit-log-exec" -Force -AsJob
+```
 
-# 2) Deploy (interactive subscription picker, single login)
+You can then verify that the Function App, storage account, LAW, and App Insights are gone.
+
+---
+
+## Quick start
+
+```powershell
+# Build function package
+pwsh ./build-audit-zip.ps1
+
+# Deploy everything (interactive subscription selection)
 pwsh ./deploy-tenant-audit.ps1 `
   -TenantId "<TENANT_GUID>" `
   -NotificationEmail "you@example.com"
 ```
 
-Done. All resources land in **one RG**; diagnostics enabled across tenant subscriptions where you have rights.
+After that, the system will automatically archive Azure Activity Logs to the central `audit` container using the schedule in the timer function.
