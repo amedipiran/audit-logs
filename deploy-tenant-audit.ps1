@@ -6,7 +6,7 @@ param(
   [ValidateSet('westeurope','northeurope','swedencentral','uksouth','ukwest','francecentral','germanywestcentral','switzerlandnorth','eastus','eastus2','centralus','westus','westus2','westus3')]
   [string] $Location = 'swedencentral',
 
-  [string] $ResourceGroup = 'rg-audit-log-exec',
+  [string] $ResourceGroup = 'rg-az-audit-log-exec',
   [string] $ContainerName = 'audit',
 
   [int] $DaysToArchive = 91,
@@ -56,7 +56,7 @@ function Get-StableStorageName([string]$subId){
 }
 
 function Get-StableFuncName([string]$subId){
-  "fn-audit-log-exec-" + (Get-ShortHash $subId)
+  "fn-az-audit-log-exec-" + (Get-ShortHash $subId)
 }
 
 function Register-Provider([string]$ns){
