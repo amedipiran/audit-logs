@@ -119,8 +119,14 @@ if (-not $stObj) { throw "Storage account not found: RG=$RG Name=$ST_ACCOUNT" }
 $stCtx = New-AzStorageContext -StorageAccountName $ST_ACCOUNT -UseConnectedAccount
 
 if (-not (Get-AzStorageContainer -Context $stCtx -Name $CONTAINER -ErrorAction SilentlyContinue)) {
-  New-AzStorageContainer -Name $CONTAINER -Context $stCtx -Permission Off | Out-Null
-  Write-Host "Created container '$CONTAINER'"
+  try {
+    New-AzStorageContainer -Name $CONTAINER -Context $stCtx -Permission Off -ErrorAction Stop | Out-Null
+    Write-Host "Created container '$CONTAINER'"
+  }
+  catch [Microsoft.WindowsAzure.Commands.Storage.Common.ResourceAlreadyExistException] {
+    # Container was created by something else (infra script / previous run) – that's fine.
+    Write-Host "Container '$CONTAINER' already exists (caught in function)."
+  }
 }
 
 $nowUtc = (Get-Date).ToUniversalTime()
